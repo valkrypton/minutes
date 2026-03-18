@@ -19,14 +19,17 @@ use std::path::PathBuf;
 //   ~/.minutes/last-result.json — written by record on shutdown
 // ──────────────────────────────────────────────────────────────
 
+/// Path to the recording PID file (`~/.minutes/recording.pid`).
 pub fn pid_path() -> PathBuf {
     Config::minutes_dir().join("recording.pid")
 }
 
+/// Path to the in-progress audio capture file (`~/.minutes/current.wav`).
 pub fn current_wav_path() -> PathBuf {
     Config::minutes_dir().join("current.wav")
 }
 
+/// Path to the last recording result JSON (`~/.minutes/last-result.json`).
 pub fn last_result_path() -> PathBuf {
     Config::minutes_dir().join("last-result.json")
 }
@@ -53,19 +56,54 @@ pub fn check_recording() -> Result<Option<u32>, PidError> {
     }
 }
 
-/// Create PID file for current process. Errors if already recording.
+/// Create PID file for current process with exclusive file lock.
+/// Uses flock to make the check-and-write atomic, preventing TOCTOU races
+/// when two `minutes record` invocations start simultaneously.
 pub fn create() -> Result<(), PidError> {
-    if let Some(pid) = check_recording()? {
-        return Err(PidError::AlreadyRecording(pid));
-    }
+    use fs2::FileExt;
+    use std::io::Write;
 
     let path = pid_path();
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
 
+    // Open/create the PID file and acquire an exclusive lock.
+    // This is atomic: if another process holds the lock, we block briefly then check.
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&path)?;
+
+    // Try non-blocking lock — if we can't get it, another recorder is running
+    if file.try_lock_exclusive().is_err() {
+        // Read the existing PID to report which process holds it
+        let existing_pid = fs::read_to_string(&path)
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok())
+            .unwrap_or(0);
+        return Err(PidError::AlreadyRecording(existing_pid));
+    }
+
+    // We hold the lock. Check if there's a stale PID from a crashed process.
+    let existing = fs::read_to_string(&path).unwrap_or_default();
+    if let Ok(old_pid) = existing.trim().parse::<u32>() {
+        if old_pid != 0 && is_process_alive(old_pid) {
+            file.unlock().ok();
+            return Err(PidError::AlreadyRecording(old_pid));
+        }
+    }
+
+    // Write our PID (we still hold the lock)
     let pid = std::process::id();
-    fs::write(&path, pid.to_string())?;
+    // Truncate and write
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(&path)?;
+    write!(file, "{}", pid)?;
+
     tracing::debug!("PID file created: {} (PID {})", path.display(), pid);
     Ok(())
 }

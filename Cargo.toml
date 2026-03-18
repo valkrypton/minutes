@@ -48,5 +48,11 @@ tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 # Signal handling
 ctrlc = { version = "3", features = ["termination"] }
 
+# HTTP client (for LLM API calls — no secrets in process args)
+ureq = { version = "3", features = ["json"] }
+
+# File locking (atomic PID file operations)
+fs2 = "0.4"
+
 # Audio format conversion
 symphonia = { version = "0.5", features = ["mp3", "aac", "ogg", "wav", "isomp4"] }

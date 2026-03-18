@@ -326,47 +326,20 @@ fn summarize_with_ollama(
     Ok(parse_summary_response(&all_text))
 }
 
-// ── HTTP helper (minimal, no reqwest dependency) ─────────────
-// Uses curl with request body via stdin (not command args) to avoid
-// exposing API keys in the process list. Headers with secrets use
-// stdin redirection, not -H flags.
+// ── HTTP helper (ureq — pure Rust, no subprocess, no secrets in process args) ──
 
 fn http_post(
     url: &str,
     body: &serde_json::Value,
     headers: &[(&str, &str)],
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
-    use std::io::Write;
-    let body_str = serde_json::to_string(body)?;
-
-    let mut cmd = std::process::Command::new("curl");
-    cmd.args(["-s", "-X", "POST", url]);
-    // Pass body via stdin to avoid it appearing in process args
-    cmd.args(["--data-binary", "@-"]);
+    let mut request = ureq::post(url);
 
     for (key, value) in headers {
-        cmd.args(["-H", &format!("{}: {}", key, value)]);
+        request = request.header(*key, *value);
     }
 
-    cmd.stdin(std::process::Stdio::piped());
-    cmd.stdout(std::process::Stdio::piped());
-    cmd.stderr(std::process::Stdio::piped());
-
-    let mut child = cmd.spawn()?;
-
-    // Write body to stdin
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(body_str.as_bytes())?;
-    }
-
-    let output = child.wait_with_output()?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("HTTP request failed: {}", stderr).into());
-    }
-
-    let response: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    let response: serde_json::Value = request.send_json(body)?.body_mut().read_json()?;
 
     // Check for API errors
     if let Some(error) = response.get("error") {

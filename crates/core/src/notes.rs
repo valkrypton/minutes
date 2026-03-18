@@ -22,14 +22,17 @@ use std::path::{Path, PathBuf};
 //   → Includes in ## Notes section of output markdown
 // ──────────────────────────────────────────────────────────────
 
+/// Path to the current recording's notes file (`~/.minutes/current-notes.md`).
 pub fn notes_path() -> PathBuf {
     Config::minutes_dir().join("current-notes.md")
 }
 
+/// Path to the pre-meeting context file (`~/.minutes/current-context.txt`).
 pub fn context_path() -> PathBuf {
     Config::minutes_dir().join("current-context.txt")
 }
 
+/// Path to the recording start timestamp file (`~/.minutes/recording-start.txt`).
 pub fn recording_start_path() -> PathBuf {
     Config::minutes_dir().join("recording-start.txt")
 }

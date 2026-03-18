@@ -25,6 +25,8 @@ hound = { workspace = true }
 notify = { workspace = true }
 whisper-rs = { workspace = true, optional = true }
 symphonia = { workspace = true }
+ureq = { workspace = true }
+fs2 = { workspace = true }
 libc = "0.2"
 
 [dev-dependencies]

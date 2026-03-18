@@ -39,6 +39,7 @@ use std::time::Duration;
 //   ~/.minutes/inbox/failed/       — processing failed
 // ──────────────────────────────────────────────────────────────
 
+/// Path to the watcher lock file (`~/.minutes/watch.lock`).
 pub fn lock_path() -> PathBuf {
     Config::minutes_dir().join("watch.lock")
 }

@@ -14,6 +14,8 @@
 
 An open-source, privacy-first tool that turns any audio — meetings, voice memos, brain dumps — into searchable, AI-queryable memory. Not a meeting notes app — a **conversation memory layer** that integrates natively with the Claude ecosystem (MCPB, Cowork, Dispatch) while supporting any LLM.
 
+Agents have run logs. Humans have conversations. Minutes captures the human side — the decisions, the intent, the context that agents need but can't observe — and makes it queryable. In a world where agents do the work but humans still set the direction, this is the missing input.
+
 ### Core Insight
 
 Build the intelligence **inside the AI**, not next to it. Granola and Meetily are standalone apps that produce notes from meetings. This produces memory from *any conversation* — including the ones you have with yourself — that your AI assistant can recall mid-conversation.
@@ -51,6 +53,7 @@ The pipeline is the product, not the meeting. The same transcribe → summarize 
 | Cross-meeting intelligence | No | No | No | **Yes** |
 | People memory | No | No | No | **Yes** |
 | Voice memos / any audio | No | No | No | **Yes** (folder watcher, iPhone sync) |
+| Structured output for agents | No | No | No | **Yes** (decisions/intents as queryable YAML, MCP tools) |
 | Platform | macOS | Win/Mac/Linux | Web/mobile | **macOS first, then cross-platform** |
 
 ---
@@ -655,10 +658,11 @@ context: "Discuss Q2 pricing, follow up on annual billing minimum decision"
 |------|-------------|----------|
 | P4a.1 | Cross-meeting search ("what did we decide about X across all meetings?") | TBD |
 | P4a.2 | People profiles — build attendee context over time (decisions, commitments, topics they care about) | TBD |
-| P4a.3 | Decision tracking — extract decisions into a queryable index, track follow-through | TBD |
-| P4a.4 | PARA entity auto-linking (meetings → people → projects) | TBD |
-| P4a.5 | QMD collection auto-registration (`qmd collection add minutes ~/meetings`) | TBD |
-| P4a.6 | Daily note backlinks (append meeting summaries to daily notes) | TBD |
+| P4a.3 | **Structured intent extraction** — LLM summarization emits a machine-readable `intents:` block in YAML frontmatter alongside the human-readable summary. Decisions, action items, open questions, and commitments as typed entries with `who`, `what`, `status`, and `by_date` fields. The markdown stays readable; the frontmatter becomes agent-queryable. MCP `search_meetings` gains a `--intents-only` filter that returns structured data, not prose. | TBD |
+| P4a.4 | **Decision consistency tracking** — the `meeting-analyst` agent compares new meeting intents against the existing intent index. Flags contradictions ("March 5: launch date April 1. March 12: launch date pushed to May.") and stale commitments ("Logan committed to send spec by March 8 — no follow-up in 3 meetings since"). Outputs a `consistency_report` via MCP tool, not just a wall of text. | TBD |
+| P4a.5 | PARA entity auto-linking (meetings → people → projects) | TBD |
+| P4a.6 | QMD collection auto-registration (`qmd collection add minutes ~/meetings`) | TBD |
+| P4a.7 | Daily note backlinks (append meeting summaries to daily notes) | TBD |
 
 #### 4b: Claude Cowork + Dispatch Integration
 
@@ -865,7 +869,7 @@ Epic: Minutes — Open Source Conversation Memory
 │   ├── P2b.7-8: Hooks (SessionStart, PostToolUse)
 │   └── P2b.9-10: MCP config + README
 ├── Phase 3: Tauri Menu Bar (8 tasks)
-├── Phase 4a: Intelligence Layer (6 tasks)
+├── Phase 4a: Intelligence Layer (7 tasks)
 ├── Phase 4b: Cowork + Dispatch (8 tasks)
 │   ├── P4b.1: Cowork connector research
 │   ├── P4b.2: Dispatch recording flow
@@ -1098,8 +1102,10 @@ const tools = {
 ### Phase 1: Developer traction (GitHub stars)
 - Launch on GitHub with polished README, demo GIF, clear install
 - Post to Hacker News, r/selfhosted, r/productivity
-- "Open-source Granola alternative with speaker diarization + voice memo processing" — clear positioning
+- "Open-source Granola alternative with speaker diarization + voice memo processing" for the selfhosted crowd
+- "Your AI remembers every conversation you've had" for the broader pitch
 - Voice memo angle appeals to a wider audience than meeting-only tools (r/PKM, r/ObsidianMD, r/ADHD)
+- Agent-native angle for the Claude/AI crowd: "Agents have run logs. Humans have conversations. This bridges the gap."
 
 ### Phase 2: Claude ecosystem native
 - List on Claude Desktop extension directory (when available)

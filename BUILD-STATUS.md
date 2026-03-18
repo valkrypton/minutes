@@ -82,7 +82,9 @@
 - P3.8: Homebrew cask formula
 - P2.7: MCPB packaging (needs spec research)
 - Phase 4: Cowork/Dispatch integration
-- Phase 4: Cross-meeting intelligence improvements
+- P4a.3: Structured intent extraction (decisions/actions as queryable YAML frontmatter + MCP filter)
+- P4a.4: Decision consistency tracking (meeting-analyst flags contradictions and stale commitments)
+- Phase 4: Cross-meeting intelligence (remaining P4a tasks)
 - Real tray icon (not placeholder)
 - Apple Shortcut (.shortcut file for iPhone voice memos)
 
