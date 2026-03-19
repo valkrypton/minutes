@@ -391,7 +391,7 @@ server.tool(
           staleCommitments
             .map(
               (stale: any) =>
-                `- ${stale.kind}: ${stale.entry.what}${stale.entry.who ? ` (@${stale.entry.who})` : ""} — ${Array.isArray(stale.reasons) ? stale.reasons.join(", ") : `${stale.age_days} days old`}`
+                `- ${stale.kind}: ${stale.entry.what}${stale.entry.who ? ` (@${stale.entry.who})` : ""} — ${Array.isArray(stale.reasons) ? stale.reasons.join(", ") : `${stale.age_days} days old`}${stale.latest_follow_up ? `; latest follow-up: ${stale.latest_follow_up.title}` : ""}`
             )
             .join("\n")
       );

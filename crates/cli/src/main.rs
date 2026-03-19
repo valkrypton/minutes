@@ -591,6 +591,12 @@ fn cmd_consistency(owner: Option<&str>, stale_after_days: i64, config: &Config) 
                 stale.kind, stale.entry.what, who, due, stale.age_days, stale.meetings_since
             );
             eprintln!("    why: {}", reasons);
+            if let Some(follow_up) = &stale.latest_follow_up {
+                eprintln!(
+                    "    latest follow-up: {} — {}",
+                    follow_up.date, follow_up.title
+                );
+            }
             eprintln!("  from: {} — {}", stale.entry.date, stale.entry.title);
             eprintln!("  {}", stale.entry.path.display());
         }

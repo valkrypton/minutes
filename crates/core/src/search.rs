@@ -62,6 +62,7 @@ pub struct StaleCommitment {
     pub meetings_since: usize,
     pub age_days: i64,
     pub reasons: Vec<String>,
+    pub latest_follow_up: Option<MeetingReference>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -209,9 +210,6 @@ pub fn consistency_report(
 
     let owner_lower = owner.map(|value| value.to_lowercase());
     let now = Local::now();
-    let meeting_dates: Vec<DateTime<Local>> =
-        parsed_frontmatters.iter().map(|(_, fm)| fm.date).collect();
-
     let mut decision_groups: std::collections::HashMap<String, Vec<ReportEntry>> =
         std::collections::HashMap::new();
     let mut stale_commitments = Vec::new();
@@ -220,7 +218,9 @@ pub fn consistency_report(
         for decision in &frontmatter.decisions {
             let topic = decision
                 .topic
-                .clone()
+                .as_deref()
+                .map(normalize_topic)
+                .filter(|topic| !topic.is_empty())
                 .unwrap_or_else(|| normalize_topic(&decision.text));
             if topic.is_empty() {
                 continue;
@@ -255,11 +255,24 @@ pub fn consistency_report(
                 }
             }
 
-            let meetings_since = meeting_dates
+            let newer_meetings: Vec<_> = parsed_frontmatters
                 .iter()
-                .filter(|date| **date > frontmatter.date)
-                .count();
+                .filter(|(_, newer)| newer.date > frontmatter.date)
+                .collect();
+            let meetings_since = newer_meetings.len();
             let age_days = now.signed_duration_since(frontmatter.date).num_days();
+            let latest_follow_up =
+                newer_meetings
+                    .last()
+                    .map(|(path, frontmatter)| MeetingReference {
+                        path: path.clone(),
+                        title: frontmatter.title.clone(),
+                        date: frontmatter.date.to_rfc3339(),
+                        content_type: match frontmatter.r#type {
+                            crate::markdown::ContentType::Meeting => "meeting".to_string(),
+                            crate::markdown::ContentType::Memo => "memo".to_string(),
+                        },
+                    });
 
             let mut reasons = Vec::new();
             if age_days >= stale_after_days {
@@ -272,6 +285,13 @@ pub fn consistency_report(
                 if meetings_since >= 1 || age_days >= 1 {
                     reasons.push(format!("still open with due date {}", by_date));
                 }
+            }
+            if intent
+                .who
+                .as_deref()
+                .is_none_or(|who| who.trim().is_empty())
+            {
+                reasons.push("still open without an owner".to_string());
             }
 
             if !reasons.is_empty() {
@@ -288,6 +308,7 @@ pub fn consistency_report(
                     meetings_since,
                     age_days,
                     reasons,
+                    latest_follow_up,
                 });
             }
         }
@@ -298,7 +319,7 @@ pub fn consistency_report(
         entries.sort_by(|a, b| a.date.cmp(&b.date));
         let mut unique_values = std::collections::HashSet::new();
         for entry in &entries {
-            unique_values.insert(entry.what.to_lowercase());
+            unique_values.insert(normalize_decision_value(&entry.what));
         }
 
         if unique_values.len() > 1 {
@@ -741,6 +762,21 @@ fn normalize_topic(text: &str) -> String {
         .join(" ")
 }
 
+fn normalize_decision_value(text: &str) -> String {
+    text.chars()
+        .map(|ch| {
+            if ch.is_alphanumeric() || ch.is_whitespace() {
+                ch.to_ascii_lowercase()
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -974,6 +1010,36 @@ mod tests {
             .reasons
             .iter()
             .any(|reason| reason.contains("still open with due date March 8")));
+        assert_eq!(
+            report.stale_commitments[0]
+                .latest_follow_up
+                .as_ref()
+                .map(|meeting| meeting.title.as_str()),
+            Some("Another Follow-up")
+        );
+    }
+
+    #[test]
+    fn consistency_report_ignores_near_duplicate_decisions() {
+        let dir = TempDir::new().unwrap();
+        create_test_file(
+            dir.path(),
+            "2026-03-01-a.md",
+            "---\ntitle: Pricing Decision\ntype: meeting\ndate: 2026-03-01T12:00:00-07:00\nduration: 30m\nstatus: complete\ntags: []\nattendees: []\npeople: []\naction_items: []\ndecisions:\n  - text: Launch pricing at monthly billing per month.\n    topic: The Pricing Strategy\nintents: []\n---\n\n## Transcript\n\nPricing discussion.\n",
+        );
+        create_test_file(
+            dir.path(),
+            "2026-03-12-b.md",
+            "---\ntitle: Pricing Follow-up\ntype: meeting\ndate: 2026-03-12T12:00:00-07:00\nduration: 30m\nstatus: complete\ntags: []\nattendees: []\npeople: []\naction_items: []\ndecisions:\n  - text: Launch pricing at 399 per month\n    topic: pricing strategy\nintents: []\n---\n\n## Transcript\n\nPricing repeated.\n",
+        );
+
+        let config = Config {
+            output_dir: dir.path().to_path_buf(),
+            ..Config::default()
+        };
+
+        let report = consistency_report(&config, None, 7).unwrap();
+        assert!(report.decision_conflicts.is_empty());
     }
 
     #[test]
