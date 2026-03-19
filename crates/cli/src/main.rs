@@ -65,6 +65,10 @@ enum Commands {
         /// Maximum number of results
         #[arg(short, long, default_value = "10")]
         limit: usize,
+
+        /// Return structured intent records instead of prose snippets
+        #[arg(long)]
+        intents_only: bool,
     },
 
     /// Show open action items across all meetings
@@ -171,7 +175,8 @@ fn main() -> Result<()> {
             content_type,
             since,
             limit,
-        } => cmd_search(&query, content_type, since, limit, &config),
+            intents_only,
+        } => cmd_search(&query, content_type, since, limit, intents_only, &config),
         Commands::Actions { assignee } => cmd_actions(assignee.as_deref(), &config),
         Commands::List {
             limit,
@@ -413,6 +418,7 @@ fn cmd_search(
     content_type: Option<String>,
     since: Option<String>,
     limit: usize,
+    intents_only: bool,
     config: &Config,
 ) -> Result<()> {
     let filters = minutes_core::search::SearchFilters {
@@ -420,6 +426,36 @@ fn cmd_search(
         since,
         attendee: None,
     };
+
+    if intents_only {
+        let results = minutes_core::search::search_intents(query, config, &filters)
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+        let limited: Vec<_> = results.into_iter().take(limit).collect();
+
+        if limited.is_empty() {
+            eprintln!("No intent records found for \"{}\"", query);
+            println!("[]");
+            return Ok(());
+        }
+
+        for result in &limited {
+            let who = result.who.as_deref().unwrap_or("unassigned");
+            let due = result.by_date.as_deref().unwrap_or("no due date");
+            eprintln!(
+                "\n{} — {} [{}]",
+                result.date, result.title, result.content_type
+            );
+            eprintln!(
+                "  {:?}: {} (@{}, {}, {})",
+                result.kind, result.what, who, result.status, due
+            );
+            eprintln!("  {}", result.path.display());
+        }
+
+        let json = serde_json::to_string_pretty(&limited)?;
+        println!("{}", json);
+        return Ok(());
+    }
 
     let results = minutes_core::search::search(query, config, &filters)?;
     let limited: Vec<_> = results.into_iter().take(limit).collect();
@@ -471,7 +507,7 @@ fn cmd_actions(assignee: Option<&str>, config: &Config) -> Result<()> {
 
 fn cmd_list(limit: usize, content_type: Option<String>, config: &Config) -> Result<()> {
     // List delegates to search with an empty query — DRY, no duplicated file walking
-    cmd_search("", content_type, None, limit, config)
+    cmd_search("", content_type, None, limit, false, config)
 }
 
 fn cmd_process(

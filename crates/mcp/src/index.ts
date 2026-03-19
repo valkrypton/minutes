@@ -290,11 +290,17 @@ server.tool(
     type: z.enum(["meeting", "memo"]).optional().describe("Filter by type"),
     since: z.string().optional().describe("Only results after this date (ISO)"),
     limit: z.number().optional().default(10).describe("Maximum results"),
+    intents_only: z
+      .boolean()
+      .optional()
+      .default(false)
+      .describe("Return structured intent records instead of transcript snippets"),
   },
-  async ({ query, type: contentType, since, limit }) => {
+  async ({ query, type: contentType, since, limit, intents_only }) => {
     const args = ["search", query, "--limit", String(limit)];
     if (contentType) args.push("-t", contentType);
     if (since) args.push("--since", since);
+    if (intents_only) args.push("--intents-only");
 
     const { stdout, stderr } = await runMinutes(args);
     const results = parseJsonOutput(stdout);
@@ -306,12 +312,19 @@ server.tool(
     }
 
     const text = Array.isArray(results)
-      ? results
-          .map(
-            (r: any) =>
-              `${r.date} — ${r.title} [${r.content_type}]\n  ${r.snippet}\n  ${r.path}`
-          )
-          .join("\n\n")
+      ? intents_only
+        ? results
+            .map(
+              (r: any) =>
+                `${r.date} — ${r.title} [${r.content_type}]\n  ${r.kind}: ${r.what}${r.who ? ` (@${r.who})` : ""}${r.by_date ? ` by ${r.by_date}` : ""}\n  ${r.path}`
+            )
+            .join("\n\n")
+        : results
+            .map(
+              (r: any) =>
+                `${r.date} — ${r.title} [${r.content_type}]\n  ${r.snippet}\n  ${r.path}`
+            )
+            .join("\n\n")
       : (stderr || stdout);
 
     return { content: [{ type: "text" as const, text }] };

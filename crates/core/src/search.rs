@@ -1,6 +1,6 @@
 use crate::config::Config;
 use crate::error::SearchError;
-use crate::markdown::{extract_field, split_frontmatter};
+use crate::markdown::{extract_field, split_frontmatter, Frontmatter, IntentKind};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
@@ -22,6 +22,19 @@ pub struct SearchResult {
     pub date: String,
     pub content_type: String,
     pub snippet: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct IntentResult {
+    pub path: PathBuf,
+    pub title: String,
+    pub date: String,
+    pub content_type: String,
+    pub kind: IntentKind,
+    pub what: String,
+    pub who: Option<String>,
+    pub status: String,
+    pub by_date: Option<String>,
 }
 
 pub struct SearchFilters {
@@ -60,6 +73,38 @@ pub fn search(
     }
 
     // Sort by date descending (newest first)
+    results.sort_by(|a, b| b.date.cmp(&a.date));
+    Ok(results)
+}
+
+/// Search structured intents across all markdown files in the meetings directory.
+pub fn search_intents(
+    query: &str,
+    config: &Config,
+    filters: &SearchFilters,
+) -> Result<Vec<IntentResult>, SearchError> {
+    let dir = &config.output_dir;
+    if !dir.exists() {
+        return Err(SearchError::DirNotFound(dir.display().to_string()));
+    }
+
+    let query_lower = query.to_lowercase();
+    let mut results = Vec::new();
+
+    for entry in WalkDir::new(dir)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "md"))
+    {
+        let path = entry.path();
+        match process_intent_file(path, &query_lower, filters) {
+            Ok(mut file_results) => results.append(&mut file_results),
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error = %e, "skipping file in intent search");
+            }
+        }
+    }
+
     results.sort_by(|a, b| b.date.cmp(&a.date));
     Ok(results)
 }
@@ -111,6 +156,79 @@ fn process_file(
     } else {
         Ok(None)
     }
+}
+
+fn process_intent_file(
+    path: &Path,
+    query: &str,
+    filters: &SearchFilters,
+) -> Result<Vec<IntentResult>, SearchError> {
+    let content = std::fs::read_to_string(path)?;
+    let (frontmatter_str, _) = split_frontmatter(&content);
+    if frontmatter_str.is_empty() {
+        return Ok(vec![]);
+    }
+
+    let frontmatter: Frontmatter = serde_yaml::from_str(frontmatter_str)
+        .map_err(|e| SearchError::Io(std::io::Error::other(e.to_string())))?;
+
+    let date = frontmatter.date.to_rfc3339();
+    let content_type = match frontmatter.r#type {
+        crate::markdown::ContentType::Meeting => "meeting".to_string(),
+        crate::markdown::ContentType::Memo => "memo".to_string(),
+    };
+
+    if let Some(ref type_filter) = filters.content_type {
+        if content_type != *type_filter {
+            return Ok(vec![]);
+        }
+    }
+    if let Some(ref since) = filters.since {
+        if date < *since {
+            return Ok(vec![]);
+        }
+    }
+    if let Some(ref attendee) = filters.attendee {
+        let attendee_lower = attendee.to_lowercase();
+        let attendee_match = frontmatter
+            .attendees
+            .iter()
+            .any(|name| name.to_lowercase().contains(&attendee_lower));
+        if !attendee_match {
+            return Ok(vec![]);
+        }
+    }
+
+    let mut results = Vec::new();
+    for intent in frontmatter.intents {
+        let haystack = format!(
+            "{} {} {} {} {}",
+            frontmatter.title,
+            intent.what,
+            intent.who.clone().unwrap_or_default(),
+            intent.status,
+            intent.by_date.clone().unwrap_or_default()
+        )
+        .to_lowercase();
+
+        if !query.is_empty() && !haystack.contains(query) {
+            continue;
+        }
+
+        results.push(IntentResult {
+            path: path.to_path_buf(),
+            title: frontmatter.title.clone(),
+            date: date.clone(),
+            content_type: content_type.clone(),
+            kind: intent.kind,
+            what: intent.what,
+            who: intent.who,
+            status: intent.status,
+            by_date: intent.by_date,
+        });
+    }
+
+    Ok(results)
 }
 
 // split_frontmatter and extract_field are in markdown.rs (shared)
@@ -348,5 +466,40 @@ mod tests {
         assert_eq!(extract_field(fm, "title"), Some("My Meeting".into()));
         assert_eq!(extract_field(fm, "type"), Some("meeting".into()));
         assert_eq!(extract_field(fm, "nonexistent"), None);
+    }
+
+    #[test]
+    fn search_intents_returns_matching_structured_records() {
+        let dir = TempDir::new().unwrap();
+        create_test_file(
+            dir.path(),
+            "2026-03-17-test.md",
+            "---\ntitle: Pricing Review\ntype: meeting\ndate: 2026-03-17T12:00:00-07:00\nduration: 42m\nstatus: complete\ntags: []\nattendees: []\npeople: []\naction_items: []\ndecisions: []\nintents:\n  - kind: action-item\n    what: Send pricing doc\n    who: mat\n    status: open\n    by_date: Friday\n  - kind: commitment\n    what: Share revised pricing model\n    who: sarah\n    status: open\n    by_date: Tuesday\n---\n\n## Transcript\n\nWe discussed pricing.\n",
+        );
+
+        let config = Config {
+            output_dir: dir.path().to_path_buf(),
+            ..Config::default()
+        };
+        let filters = SearchFilters {
+            content_type: None,
+            since: None,
+            attendee: None,
+        };
+
+        let results = process_intent_file(
+            &dir.path().join("2026-03-17-test.md"),
+            "pricing",
+            &filters,
+        )
+        .unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].title, "Pricing Review");
+        assert!(results
+            .iter()
+            .any(|item| item.kind == IntentKind::ActionItem));
+        assert!(results
+            .iter()
+            .any(|item| item.kind == IntentKind::Commitment));
     }
 }
