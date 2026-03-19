@@ -138,14 +138,14 @@ fn main() {
             let paste_summary_item = MenuItem::with_id(
                 app,
                 "paste-summary",
-                "Paste Latest Summary",
+                "Copy Latest Summary",
                 true,
                 None::<&str>,
             )?;
             let paste_transcript_item = MenuItem::with_id(
                 app,
                 "paste-transcript",
-                "Paste Latest Transcript",
+                "Copy Latest Transcript",
                 true,
                 None::<&str>,
             )?;
@@ -317,13 +317,13 @@ fn main() {
                             ) {
                                 Ok(message) => {
                                     commands::show_user_notification(
-                                        &format!("Paste latest {}", kind),
+                                        &format!("Latest {}", kind),
                                         &message,
                                     );
                                 }
                                 Err(err) => {
                                     commands::show_user_notification(
-                                        &format!("Paste latest {}", kind),
+                                        &format!("Latest {}", kind),
                                         &err,
                                     );
                                 }

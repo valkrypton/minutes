@@ -477,10 +477,13 @@ pub fn paste_latest_artifact(
 
     if let Some(app_name) = target_app.filter(|name| !name.trim().is_empty()) {
         paste_into_application(app_name)?;
-        Ok(format!("Pasted latest {} into {}.", kind, app_name))
+        Ok(format!(
+            "Copied the latest {} and pasted it into {}.",
+            kind, app_name
+        ))
     } else {
         Ok(format!(
-            "Copied latest {} to the clipboard. Switch to your app and paste.",
+            "Copied the latest {} to the clipboard. Switch to your app and paste.",
             kind
         ))
     }
