@@ -253,7 +253,7 @@ server.tool(
     const args = ["list", "--limit", String(limit)];
     if (contentType) args.push("-t", contentType);
 
-    const { stdout } = await runMinutes(args);
+    const { stdout, stderr } = await runMinutes(args);
     const meetings = parseJsonOutput(stdout);
 
     if (Array.isArray(meetings) && meetings.length === 0) {
@@ -264,7 +264,7 @@ server.tool(
       ? meetings
           .map((m: any) => `${m.date} — ${m.title} [${m.content_type}]\n  ${m.path}`)
           .join("\n\n")
-      : stdout;
+      : (stderr || stdout);
 
     return { content: [{ type: "text" as const, text }] };
   }
@@ -286,7 +286,7 @@ server.tool(
     if (contentType) args.push("-t", contentType);
     if (since) args.push("--since", since);
 
-    const { stdout } = await runMinutes(args);
+    const { stdout, stderr } = await runMinutes(args);
     const results = parseJsonOutput(stdout);
 
     if (Array.isArray(results) && results.length === 0) {
@@ -302,7 +302,7 @@ server.tool(
               `${r.date} — ${r.title} [${r.content_type}]\n  ${r.snippet}\n  ${r.path}`
           )
           .join("\n\n")
-      : stdout;
+      : (stderr || stdout);
 
     return { content: [{ type: "text" as const, text }] };
   }

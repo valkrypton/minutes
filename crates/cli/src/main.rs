@@ -343,6 +343,7 @@ fn cmd_search(
 
     if limited.is_empty() {
         eprintln!("No results found for \"{}\"", query);
+        println!("[]");
         return Ok(());
     }
 
@@ -369,6 +370,7 @@ fn cmd_actions(assignee: Option<&str>, config: &Config) -> Result<()> {
 
     if results.is_empty() {
         eprintln!("No open action items found.");
+        println!("[]");
         return Ok(());
     }
 
