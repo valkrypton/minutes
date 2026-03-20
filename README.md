@@ -300,7 +300,10 @@ model = "small"           # tiny (75MB), base, small (466MB), medium, large-v3 (
 
 [summarization]
 engine = "none"           # Default: Claude summarizes conversationally via MCP
-                          # Set to "ollama" for automatic local summaries
+                          # "agent" = uses your Claude Code or Codex subscription (no API key)
+                          # "ollama" = local, free
+                          # "claude" / "openai" = direct API key (legacy)
+agent_command = "claude"  # Which CLI to use when engine = "agent" (claude, codex, etc.)
 ollama_url = "http://localhost:11434"
 ollama_model = "llama3.2"
 

@@ -41,6 +41,7 @@ pub struct DiarizationConfig {
 #[serde(default)]
 pub struct SummarizationConfig {
     pub engine: String,
+    pub agent_command: String,
     pub chunk_max_tokens: usize,
     pub ollama_url: String,
     pub ollama_model: String,
@@ -160,6 +161,7 @@ impl Default for SummarizationConfig {
     fn default() -> Self {
         Self {
             engine: "none".into(),
+            agent_command: "claude".into(),
             chunk_max_tokens: 4000,
             ollama_url: "http://localhost:11434".into(),
             ollama_model: "llama3.2".into(),

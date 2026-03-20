@@ -1666,9 +1666,10 @@
             <div class="about-controls-meta" style="margin-bottom: 6px;">By default, Claude summarizes your meetings conversationally via MCP — no configuration needed. Turn this on only if you want summaries generated automatically in the recording pipeline.</div>
             <select id="settings-summarization-engine" style="width: 100%; padding: 6px 8px; border-radius: 8px; background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.1); color: var(--text); font-size: 13px;">
               <option value="none">Off — Claude summarizes when you ask (recommended)</option>
+              <option value="agent">Agent CLI — uses your Claude Code or Codex subscription</option>
               <option value="ollama">Ollama — local, free, runs on your machine</option>
-              <option value="claude">Claude API — uses your Anthropic API key</option>
-              <option value="openai">OpenAI API — uses your OpenAI API key</option>
+              <option value="claude">Claude API — direct API key (legacy)</option>
+              <option value="openai">OpenAI API — direct API key (legacy)</option>
             </select>
             <div class="about-controls-meta" id="settings-summarization-status"></div>
           </div>
@@ -2870,6 +2871,7 @@
     function updateSumStatus(s) {
       const el = document.getElementById('settings-summarization-status');
       if (s.summarization.engine === 'none') el.textContent = '';
+      else if (s.summarization.engine === 'agent') el.textContent = 'Using: ' + (s.summarization.agent_command || 'claude') + ' — no API key needed, uses your existing subscription';
       else if (s.summarization.engine === 'ollama') el.textContent = s.summarization.ollama_reachable ? 'Ollama reachable (' + s.summarization.ollama_model + ')' : 'Ollama not reachable at ' + s.summarization.ollama_url;
       else if (s.summarization.engine === 'claude') el.textContent = s.summarization.anthropic_key_set ? 'API key set' : 'ANTHROPIC_API_KEY not found in environment';
       else if (s.summarization.engine === 'openai') el.textContent = s.summarization.openai_key_set ? 'API key set' : 'OPENAI_API_KEY not found in environment';

@@ -1869,6 +1869,7 @@ pub fn cmd_get_settings() -> serde_json::Value {
         },
         "summarization": {
             "engine": config.summarization.engine,
+            "agent_command": config.summarization.agent_command,
             "ollama_model": config.summarization.ollama_model,
             "ollama_url": config.summarization.ollama_url,
             "anthropic_key_set": anthropic_key_set,
@@ -1900,6 +1901,7 @@ pub fn cmd_set_setting(section: String, key: String, value: String) -> Result<St
 
         // Summarization
         ("summarization", "engine") => config.summarization.engine = value.clone(),
+        ("summarization", "agent_command") => config.summarization.agent_command = value.clone(),
         ("summarization", "ollama_model") => config.summarization.ollama_model = value.clone(),
         ("summarization", "ollama_url") => config.summarization.ollama_url = value.clone(),
 

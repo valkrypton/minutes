@@ -46,9 +46,10 @@ pub fn summarize_with_screens(
     tracing::info!(engine = %engine, "running LLM summarization");
 
     let result = match engine.as_str() {
+        "agent" => summarize_with_agent(transcript, config),
         "claude" => summarize_with_claude(transcript, screen_files, config),
         "openai" => summarize_with_openai(transcript, screen_files, config),
-        "ollama" => summarize_with_ollama(transcript, config), // Ollama: text only
+        "ollama" => summarize_with_ollama(transcript, config),
         other => {
             tracing::warn!(engine = %other, "unknown summarization engine, skipping");
             return None;
@@ -224,6 +225,92 @@ fn parse_summary_response(response: &str) -> Summary {
         commitments,
         key_points,
     }
+}
+
+// ── Agent CLI (claude -p, codex exec, etc.) ─────────────────
+//
+// Uses the user's installed AI agent CLI to summarize.
+// No API keys needed — uses the agent's own auth (subscription, OAuth, etc.)
+//
+// Supported agents:
+//   "claude" → `claude -p "prompt" --no-input` (Claude Code CLI)
+//   "codex"  → `codex exec "prompt"` (OpenAI Codex CLI)
+//   Any other → treated as a command that accepts a prompt on stdin
+//
+// The agent command is configurable via [summarization] agent_command.
+
+fn summarize_with_agent(
+    transcript: &str,
+    config: &Config,
+) -> Result<Summary, Box<dyn std::error::Error>> {
+    let agent_cmd = if config.summarization.agent_command.is_empty() {
+        "claude".to_string()
+    } else {
+        config.summarization.agent_command.clone()
+    };
+
+    let prompt = format!(
+        "{}\n\nSummarize this transcript:\n\n{}",
+        SYSTEM_PROMPT,
+        // Truncate very long transcripts to avoid CLI arg limits
+        if transcript.len() > 100_000 {
+            &transcript[..100_000]
+        } else {
+            transcript
+        }
+    );
+
+    tracing::info!(agent = %agent_cmd, "summarizing via agent CLI");
+
+    let output = if agent_cmd == "claude" || agent_cmd.ends_with("/claude") {
+        // Claude Code: `claude -p "prompt" --no-input`
+        std::process::Command::new(&agent_cmd)
+            .args(["-p", &prompt, "--no-input"])
+            .output()
+    } else if agent_cmd == "codex" || agent_cmd.ends_with("/codex") {
+        // Codex CLI: `codex exec "prompt" -s read-only`
+        std::process::Command::new(&agent_cmd)
+            .args(["exec", &prompt, "-s", "read-only"])
+            .output()
+    } else {
+        // Generic: pipe prompt via stdin
+        use std::io::Write;
+        let mut child = std::process::Command::new(&agent_cmd)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()?;
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(prompt.as_bytes())?;
+        }
+        Ok(child.wait_with_output()?)
+    };
+
+    let output = output.map_err(|e| {
+        format!(
+            "Agent '{}' not found or failed to start: {}. \
+             Install it or change [summarization] agent_command in config.toml",
+            agent_cmd, e
+        )
+    })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("Agent '{}' exited with error: {}", agent_cmd, stderr).into());
+    }
+
+    let response = String::from_utf8_lossy(&output.stdout).to_string();
+    if response.trim().is_empty() {
+        return Err(format!("Agent '{}' returned empty output", agent_cmd).into());
+    }
+
+    tracing::info!(
+        agent = %agent_cmd,
+        response_len = response.len(),
+        "agent summarization complete"
+    );
+
+    Ok(parse_summary_response(&response))
 }
 
 // ── Claude API ───────────────────────────────────────────────
