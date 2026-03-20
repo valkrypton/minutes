@@ -31,6 +31,9 @@ function escapeAttr(s: string): string {
 // ─── State ────────────────────────────────────────────────────────────────────
 
 let cachedDashboardData: any = null;
+let currentDetailData: { content: string; path: string; title: string } | null = null;
+let activeFilter: "all" | "meeting" | "memo" = "all";
+let recordingPollTimer: ReturnType<typeof setInterval> | null = null;
 
 const VIEWS = ["loading", "error", "dashboard", "detail", "person", "report"] as const;
 type View = (typeof VIEWS)[number];
@@ -166,6 +169,119 @@ const app = new App(
   { autoResize: true },
 );
 
+// ─── Feature: Recording Status ───────────────────────────────────────────────
+
+let recordingStartTime: number | null = null;
+
+async function checkRecordingStatus() {
+  try {
+    const result = await app.callServerTool({ name: "get_status", arguments: {} });
+    const text = result.content?.map((c: any) => ("text" in c ? c.text : "")).join("") || "";
+    const isRecording = text.includes("in progress");
+
+    const banner = $("recording-banner");
+    if (isRecording) {
+      if (!recordingStartTime) recordingStartTime = Date.now();
+      banner.style.display = "flex";
+      updateRecordingElapsed();
+      if (!recordingPollTimer) {
+        recordingPollTimer = setInterval(updateRecordingElapsed, 1000);
+      }
+    } else {
+      banner.style.display = "none";
+      recordingStartTime = null;
+      if (recordingPollTimer) {
+        clearInterval(recordingPollTimer);
+        recordingPollTimer = null;
+      }
+    }
+  } catch {
+    // Non-fatal — just hide the banner
+    $("recording-banner").style.display = "none";
+  }
+}
+
+function updateRecordingElapsed() {
+  if (!recordingStartTime) return;
+  const elapsed = Math.floor((Date.now() - recordingStartTime) / 1000);
+  const mins = Math.floor(elapsed / 60);
+  const secs = elapsed % 60;
+  $("rec-elapsed").textContent = `${mins}:${String(secs).padStart(2, "0")}`;
+}
+
+// Stop button
+document.addEventListener("click", async (e) => {
+  if ((e.target as HTMLElement).id === "rec-stop-btn") {
+    const btn = e.target as HTMLButtonElement;
+    btn.disabled = true;
+    btn.textContent = "Stopping...";
+    try {
+      await app.callServerTool({ name: "stop_recording", arguments: {} });
+      $("recording-banner").style.display = "none";
+      recordingStartTime = null;
+      if (recordingPollTimer) {
+        clearInterval(recordingPollTimer);
+        recordingPollTimer = null;
+      }
+    } catch {
+      btn.disabled = false;
+      btn.textContent = "Stop";
+    }
+  }
+});
+
+// ─── Feature: Client-side Filter ─────────────────────────────────────────────
+
+function applyFilter() {
+  const query = ($("filter-input") as HTMLInputElement).value.toLowerCase();
+  document.querySelectorAll(".meeting-card").forEach((card) => {
+    const el = card as HTMLElement;
+    const title = el.querySelector(".meeting-title")?.textContent?.toLowerCase() || "";
+    const date = el.querySelector(".meeting-date")?.textContent?.toLowerCase() || "";
+    const type = el.querySelector(".badge")?.textContent?.toLowerCase() || "";
+
+    const matchesQuery = !query || title.includes(query) || date.includes(query);
+    const matchesType = activeFilter === "all" || type === activeFilter;
+
+    el.style.display = matchesQuery && matchesType ? "" : "none";
+  });
+}
+
+// Filter input
+$("filter-input").addEventListener("input", applyFilter);
+
+// Type toggles
+document.querySelectorAll(".filter-btn").forEach((btn) => {
+  btn.addEventListener("click", () => {
+    document.querySelectorAll(".filter-btn").forEach((b) => b.classList.remove("active"));
+    btn.classList.add("active");
+    activeFilter = (btn as HTMLElement).dataset.filter as any;
+    applyFilter();
+  });
+});
+
+// ─── Feature: Context Injection ──────────────────────────────────────────────
+
+function sendMeetingToContext() {
+  if (!currentDetailData) return;
+  const { title, content } = currentDetailData;
+  const truncated = content.length > 15000 ? content.slice(0, 15000) + "\n\n[truncated]" : content;
+  app.updateModelContext({
+    content: [{ type: "text", text: `Meeting: ${title}\n\n${truncated}` }],
+  });
+}
+
+// ─── Feature: Fullscreen ─────────────────────────────────────────────────────
+
+let isFullscreen = false;
+
+function toggleFullscreen() {
+  isFullscreen = !isFullscreen;
+  app.requestDisplayMode({ mode: isFullscreen ? "fullscreen" : "inline" });
+  const btn = $("fullscreen-btn");
+  if (btn) btn.textContent = isFullscreen ? "Exit Fullscreen" : "Fullscreen";
+}
+
 // ─── View: Dashboard ─────────────────────────────────────────────────────────
 
 function renderDashboard(data: any) {
@@ -244,7 +360,17 @@ function renderDashboard(data: any) {
     setInner(sidebarEl, "");
   }
 
+  // Reset filter UI
+  ($("filter-input") as HTMLInputElement).value = "";
+  activeFilter = "all";
+  document.querySelectorAll(".filter-btn").forEach((b) => {
+    b.classList.toggle("active", (b as HTMLElement).dataset.filter === "all");
+  });
+
   showView("dashboard");
+
+  // Check recording status
+  checkRecordingStatus();
 }
 
 // ─── View: Detail ─────────────────────────────────────────────────────────────
@@ -254,8 +380,11 @@ function renderDetail(data: any) {
   const meetingPath: string = data.path || "";
   const { frontmatter, body } = parseFrontmatter(content);
 
-  // Header
+  // Track for context injection
   const title = frontmatter.title || meetingPath.split("/").pop()?.replace(/\.md$/, "") || "Meeting";
+  currentDetailData = { content, path: meetingPath, title };
+
+  // Header
   setInner(
     $("detail-header"),
     `<h1>${escapeHtml(title)}</h1>
@@ -267,7 +396,7 @@ function renderDetail(data: any) {
     </div>
     ${
       Array.isArray(frontmatter.attendees) && frontmatter.attendees.length
-        ? `<div class="attendees">Attendees: ${frontmatter.attendees.map((a: string) => `<span class="attendee">${escapeHtml(a)}</span>`).join(" ")}</div>`
+        ? `<div class="attendees">Attendees: ${frontmatter.attendees.map((a: string) => `<span class="attendee clickable" data-person="${escapeAttr(a)}">${escapeHtml(a)}</span>`).join(" ")}</div>`
         : ""
     }
     ${
@@ -276,6 +405,23 @@ function renderDetail(data: any) {
         : ""
     }`,
   );
+
+  // Clickable attendees → person profile
+  $("detail-header").querySelectorAll(".attendee.clickable").forEach((el) => {
+    el.addEventListener("click", async (e) => {
+      e.stopPropagation();
+      const name = (el as HTMLElement).dataset.person;
+      if (!name) return;
+      showView("loading");
+      $("loading-text").textContent = `Loading profile for ${name}...`;
+      try {
+        const result = await app.callServerTool({ name: "get_person_profile", arguments: { name } });
+        handleToolResult(result);
+      } catch (err: any) {
+        showError(err.message || "Failed to load profile");
+      }
+    });
+  });
 
   // Body
   setInner($("detail-content"), renderMarkdown(body));
@@ -317,12 +463,16 @@ function renderDetail(data: any) {
 
   setInner($("detail-panels"), panels.join(""));
 
-  // Back button
+  // Toolbar buttons
   $("back-btn").onclick = () => {
+    if (isFullscreen) toggleFullscreen();
     if (cachedDashboardData) {
       renderDashboard(cachedDashboardData);
     }
   };
+  $("context-btn").onclick = sendMeetingToContext;
+  $("fullscreen-btn").onclick = toggleFullscreen;
+  $("fullscreen-btn").textContent = isFullscreen ? "Exit Fullscreen" : "Fullscreen";
 
   showView("detail");
 }
@@ -528,4 +678,6 @@ app.onhostcontextchanged = handleHostContext;
 app.connect().then(() => {
   const ctx = app.getHostContext();
   if (ctx) handleHostContext(ctx);
+  // Check recording status on connect
+  checkRecordingStatus();
 });
