@@ -1,0 +1,92 @@
+# minutes
+
+> Your AI remembers every conversation you've had.
+
+minutes is an open-source, privacy-first conversation memory layer for AI assistants. It captures any audio (meetings, voice memos, brain dumps), transcribes locally with whisper.cpp, diarizes speakers, and outputs searchable markdown with structured action items and decisions.
+
+## Key Facts
+
+- License: MIT
+- Language: Rust (core engine), TypeScript (MCP server)
+- Platforms: macOS (primary), Windows, Linux
+- Source: https://github.com/silverstein/minutes
+- Install: `brew install silverstein/tap/minutes` (CLI) or `brew install --cask silverstein/tap/minutes` (desktop app)
+
+## For AI Agents
+
+minutes exposes a standard MCP server with 12 tools and 6 resources. Any MCP-compatible client can use it as a conversation memory layer.
+
+### MCP Server Setup
+
+```json
+{
+  "mcpServers": {
+    "minutes": {
+      "command": "node",
+      "args": ["/path/to/minutes/crates/mcp/dist/index.js"]
+    }
+  }
+}
+```
+
+### MCP Tools
+
+- `start_recording` — Start recording audio from the default input device
+- `stop_recording` — Stop recording and process through the pipeline
+- `get_status` — Check if a recording is in progress
+- `list_meetings` — List recent meetings and memos with metadata
+- `search_meetings` — Full-text search across all meeting transcripts and frontmatter
+- `get_meeting` — Get the full content of a specific meeting by slug
+- `process_audio` — Process an audio file through the transcription pipeline
+- `add_note` — Add a timestamped note to the current recording
+- `consistency_report` — Flag contradicting decisions and stale commitments
+- `get_person_profile` — Build a cross-meeting profile for a person
+- `research_topic` — Research a topic across all meetings, decisions, and action items
+- `qmd_collection_status` — Check QMD semantic search collection status
+
+### MCP Resources
+
+- `minutes://meetings/recent` — Recent meetings list
+- `minutes://status` — Current recording status
+- `minutes://actions/open` — Open action items across all meetings
+- `minutes://events/recent` — Recent pipeline events
+- `minutes://meetings/{slug}` — Specific meeting by slug
+- `ui://minutes/dashboard` — Interactive dashboard (MCP Apps)
+
+### Output Format
+
+Meetings are stored as markdown with YAML frontmatter:
+
+```yaml
+---
+title: Q2 Pricing Discussion
+type: meeting
+date: 2026-03-17T14:00:00
+duration: 42m
+attendees: [Alex K., Jordan M.]
+action_items:
+  - assignee: mat
+    task: Send pricing doc
+    due: Friday
+    status: open
+decisions:
+  - text: Run pricing experiment at monthly billing
+    topic: pricing
+---
+```
+
+### Capabilities for Agents
+
+1. **Meeting recall** — Search and retrieve any past meeting by topic, attendee, date, or content
+2. **People profiles** — Build cross-meeting profiles showing topics, commitments, and interaction patterns
+3. **Decision tracking** — Structured decisions with consistency checking across meetings
+4. **Action item management** — Query open items by assignee, due date, or meeting
+5. **Recording control** — Start/stop recordings programmatically from any MCP client
+6. **Voice memo processing** — Process audio files dropped into watched folders
+
+## Documentation
+
+- README: https://github.com/silverstein/minutes/blob/main/README.md
+- Architecture: https://github.com/silverstein/minutes/blob/main/PLAN.md
+- Contributing: https://github.com/silverstein/minutes/blob/main/CONTRIBUTING.md
+- MCP Server: https://github.com/silverstein/minutes/tree/main/crates/mcp
