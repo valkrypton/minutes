@@ -1538,7 +1538,7 @@
           <div class="detail-meta" id="detail-meta"></div>
         </div>
         <div class="detail-actions">
-          <button class="btn btn-secondary btn-sm" id="btn-discuss-ai">Discuss with AI</button>
+          <button class="btn btn-secondary btn-sm" id="btn-discuss-ai">Discuss with Agent</button>
           <button class="btn btn-secondary btn-sm" id="btn-open-external">Open in Editor</button>
           <button class="btn btn-secondary btn-sm" id="btn-detail-close">Close</button>
         </div>
@@ -3502,12 +3502,13 @@
       if (e.key === 'Enter') { e.preventDefault(); saveRecallNote(); }
     });
 
-    // ── Discuss with AI (from meeting detail) ──
+    // ── Discuss with Agent (from meeting detail) ──
     document.getElementById('btn-discuss-ai').addEventListener('click', async () => {
       if (!currentMeetingPath) return;
-      closeDetailView();
-      await openRecall('meeting', currentMeetingPath);
+      const path = currentMeetingPath;
       const title = currentMeetingDetail ? currentMeetingDetail.title : 'Meeting';
+      closeDetailView();
+      await openRecall('meeting', path);
       setRecallPhase('debrief', title);
     });
 

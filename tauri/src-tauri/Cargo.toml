@@ -5,7 +5,7 @@ edition = "2021"
 description = "Minutes — menu bar app for conversation memory"
 
 [dependencies]
-tauri = { version = "2", features = ["tray-icon", "image-png"] }
+tauri = { version = "2", features = ["tray-icon", "image-png", "devtools"] }
 tauri-plugin-shell = "2"
 tauri-plugin-global-shortcut = "2"
 tauri-plugin-dialog = "2"

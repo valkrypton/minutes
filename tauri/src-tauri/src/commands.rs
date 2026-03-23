@@ -1619,8 +1619,7 @@ pub fn cmd_get_meeting_detail(path: String) -> Result<MeetingDetail, String> {
     let content = std::fs::read_to_string(&meeting_path).map_err(|e| e.to_string())?;
     let (frontmatter_str, body) = minutes_core::markdown::split_frontmatter(&content);
     let frontmatter: minutes_core::markdown::Frontmatter =
-        serde_yaml::from_str(&format!("---\n{}\n---", frontmatter_str))
-            .map_err(|e| e.to_string())?;
+        serde_yaml::from_str(frontmatter_str.trim()).map_err(|e| e.to_string())?;
 
     let content_type = match frontmatter.r#type {
         ContentType::Meeting => "meeting",
