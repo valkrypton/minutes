@@ -1,7 +1,7 @@
 use crate::calendar::CalendarEvent;
 use crate::config::Config;
 use crate::error::MinutesError;
-use crate::markdown::ContentType;
+use crate::markdown::{ContentType, OutputStatus};
 use crate::pid::{self, CaptureMode, PidGuard};
 use crate::pipeline::{self, BackgroundPipelineContext, PipelineStage};
 use chrono::{DateTime, Local};
@@ -20,13 +20,14 @@ pub enum JobState {
     Diarizing,
     Summarizing,
     Saving,
+    NeedsReview,
     Complete,
     Failed,
 }
 
 impl JobState {
     pub fn is_terminal(self) -> bool {
-        matches!(self, Self::Complete | Self::Failed)
+        matches!(self, Self::NeedsReview | Self::Complete | Self::Failed)
     }
 
     pub fn default_stage(self) -> Option<String> {
@@ -37,6 +38,7 @@ impl JobState {
             Self::Diarizing => Some("Separating speakers".into()),
             Self::Summarizing => Some("Generating summary".into()),
             Self::Saving => Some("Saving artifact".into()),
+            Self::NeedsReview => Some("Needs review — raw capture preserved".into()),
             Self::Complete => None,
             Self::Failed => Some("Processing failed".into()),
         }
@@ -389,6 +391,18 @@ pub fn remove_capture_artifacts(job: &ProcessingJob) {
     }
 }
 
+fn terminal_state_for_artifact(artifact: &pipeline::TranscriptArtifact) -> JobState {
+    if artifact.frontmatter.status == Some(OutputStatus::NoSpeech) {
+        JobState::NeedsReview
+    } else {
+        JobState::Complete
+    }
+}
+
+fn should_preserve_capture(state: JobState) -> bool {
+    matches!(state, JobState::NeedsReview | JobState::Failed)
+}
+
 fn sync_processing_status() {
     if let Some(job) = processing_summary() {
         let title = job.title.as_deref().or(job.output_path.as_deref());
@@ -504,6 +518,45 @@ where
             }
         };
 
+        if artifact.frontmatter.status == Some(OutputStatus::NoSpeech) {
+            let terminal_state = terminal_state_for_artifact(&artifact);
+            let Some(review_job) = update_job_state(&job.id, |job| {
+                job.state = terminal_state;
+                job.stage = terminal_state.default_stage();
+                job.output_path = Some(artifact.write_result.path.display().to_string());
+                job.title = Some(artifact.write_result.title.clone());
+                job.word_count = Some(artifact.write_result.word_count);
+                job.finished_at = Some(Local::now());
+                job.owner_pid = None;
+                job.error = Some(
+                    artifact
+                        .frontmatter
+                        .filter_diagnosis
+                        .clone()
+                        .unwrap_or_else(|| "Transcript requires manual review.".into()),
+                );
+            })?
+            else {
+                sync_processing_status();
+                continue;
+            };
+            crate::events::append_event(crate::events::audio_processed_event(
+                &artifact.write_result,
+                &audio_path.display().to_string(),
+            ));
+            crate::events::append_event(crate::events::recording_completed_event(
+                &artifact.write_result,
+                &recording_duration(&review_job),
+            ));
+            if let Err(error) = crate::graph::rebuild_index(config) {
+                tracing::warn!(error = %error, "graph index rebuild failed after queued job");
+            }
+            refresh_qmd_collection(config);
+            sync_processing_status();
+            on_job_update(&review_job);
+            continue;
+        }
+
         let Some(updated_job) = update_job_state(&job.id, |job| {
             job.state = JobState::TranscriptOnly;
             job.stage = JobState::TranscriptOnly.default_stage();
@@ -538,9 +591,10 @@ where
 
         match enrich_result {
             Ok(result) => {
+                let terminal_state = terminal_state_for_artifact(&artifact);
                 let Some(completed_job) = update_job_state(&job.id, |job| {
-                    job.state = JobState::Complete;
-                    job.stage = None;
+                    job.state = terminal_state;
+                    job.stage = terminal_state.default_stage();
                     job.output_path = Some(result.path.display().to_string());
                     job.title = Some(result.title.clone());
                     job.word_count = Some(result.word_count);
@@ -563,7 +617,9 @@ where
                     tracing::warn!(error = %error, "graph index rebuild failed after queued job");
                 }
                 refresh_qmd_collection(config);
-                remove_capture_artifacts(&completed_job);
+                if !should_preserve_capture(completed_job.state) {
+                    remove_capture_artifacts(&completed_job);
+                }
                 sync_processing_status();
                 on_job_update(&completed_job);
             }
@@ -592,6 +648,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::markdown::{Frontmatter, WriteResult};
 
     fn with_temp_home<T>(f: impl FnOnce(&tempfile::TempDir) -> T) -> T {
         let _guard = crate::test_home_env_lock();
@@ -645,6 +702,50 @@ mod tests {
             assert!(PathBuf::from(&job.audio_path).exists());
             assert!(crate::screen::screens_dir_for(Path::new(&job.audio_path)).exists());
         });
+    }
+
+    #[test]
+    fn no_speech_artifacts_require_review_and_preserve_capture() {
+        let artifact = pipeline::TranscriptArtifact {
+            write_result: WriteResult {
+                path: PathBuf::from("/tmp/review.md"),
+                title: "Untitled Recording".into(),
+                word_count: 0,
+                content_type: ContentType::Meeting,
+            },
+            frontmatter: Frontmatter {
+                title: "Untitled Recording".into(),
+                r#type: ContentType::Meeting,
+                date: Local::now(),
+                duration: "5m".into(),
+                source: None,
+                status: Some(OutputStatus::NoSpeech),
+                tags: vec![],
+                attendees: vec![],
+                calendar_event: None,
+                people: vec![],
+                entities: crate::markdown::EntityLinks::default(),
+                device: None,
+                captured_at: None,
+                context: None,
+                action_items: vec![],
+                decisions: vec![],
+                intents: vec![],
+                recorded_by: None,
+                visibility: None,
+                speaker_map: vec![],
+                filter_diagnosis: Some("silence strip removed ALL audio".into()),
+            },
+            transcript: String::new(),
+        };
+
+        assert_eq!(
+            terminal_state_for_artifact(&artifact),
+            JobState::NeedsReview
+        );
+        assert!(JobState::NeedsReview.is_terminal());
+        assert!(should_preserve_capture(JobState::NeedsReview));
+        assert!(!should_preserve_capture(JobState::Complete));
     }
 
     #[test]

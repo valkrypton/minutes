@@ -418,7 +418,7 @@ fn load_audio_samples(path: &Path) -> Result<Vec<f32>, TranscribeError> {
 
     match ext.as_str() {
         "wav" => load_wav(path),
-        "m4a" | "mp3" | "ogg" | "webm" | "mp4" | "aac" => {
+        "m4a" | "mp3" | "ogg" | "webm" | "mp4" | "mov" | "aac" => {
             // Prefer ffmpeg — its resampler and AAC decoder produce samples that
             // whisper transcribes correctly across all languages. Symphonia's AAC
             // decoder produces subtly different samples that trigger hallucination

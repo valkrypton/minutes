@@ -39,7 +39,7 @@ import { z } from "zod";
 import { execFile, spawn } from "child_process";
 import { promisify } from "util";
 import { existsSync } from "fs";
-import { readFile } from "fs/promises";
+import { mkdir, readFile, rm, writeFile } from "fs/promises";
 import { delimiter, dirname, isAbsolute, join, relative, resolve } from "path";
 import { fileURLToPath } from "url";
 import { homedir } from "os";
@@ -393,6 +393,107 @@ async function isCliAvailable(): Promise<boolean> {
   return cliAvailable;
 }
 
+type DesktopAppStatus = {
+  pid: number;
+  updated_at: string;
+  platform: string;
+};
+
+type DesktopControlResponse = {
+  id: string;
+  handled_at: string;
+  accepted: boolean;
+  detail: string;
+};
+
+function desktopControlDir(): string {
+  return join(homedir(), ".minutes", "desktop-control");
+}
+
+function desktopAppStatusPath(): string {
+  return join(desktopControlDir(), "desktop-app.json");
+}
+
+function desktopRequestPath(id: string): string {
+  return join(desktopControlDir(), "requests", `${id}.json`);
+}
+
+function desktopResponsePath(id: string): string {
+  return join(desktopControlDir(), "responses", `${id}.json`);
+}
+
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function readRunningDesktopAppStatus(): Promise<DesktopAppStatus | null> {
+  try {
+    const raw = await readFile(desktopAppStatusPath(), "utf8");
+    const status = JSON.parse(raw) as DesktopAppStatus;
+    const updatedAt = Date.parse(status.updated_at);
+    if (!Number.isFinite(updatedAt)) return null;
+    if (Date.now() - updatedAt > 10000) return null;
+    if (!status.pid || !isProcessAlive(status.pid)) return null;
+    return status;
+  } catch {
+    return null;
+  }
+}
+
+async function delegateCallRecordingToDesktop(args: {
+  title?: string;
+  mode: "meeting" | "quick-thought";
+  intent: "call";
+  allow_degraded: boolean;
+  language?: string;
+}): Promise<DesktopControlResponse | null> {
+  const status = await readRunningDesktopAppStatus();
+  if (!status) return null;
+
+  const id = `mcp-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  await mkdir(join(desktopControlDir(), "requests"), { recursive: true });
+  await mkdir(join(desktopControlDir(), "responses"), { recursive: true });
+
+  const request = {
+    id,
+    created_at: new Date().toISOString(),
+    action: {
+      type: "start-recording",
+      mode: args.mode,
+      intent: args.intent,
+      allow_degraded: args.allow_degraded,
+      title: args.title,
+      language: args.language,
+    },
+  };
+
+  const requestPath = desktopRequestPath(id);
+  const responsePath = desktopResponsePath(id);
+  await writeFile(requestPath, JSON.stringify(request, null, 2), "utf8");
+
+  const timeoutAt = Date.now() + 10000;
+  try {
+    while (Date.now() < timeoutAt) {
+      if (existsSync(responsePath)) {
+        const response = JSON.parse(
+          await readFile(responsePath, "utf8")
+        ) as DesktopControlResponse;
+        await rm(responsePath, { force: true });
+        return response;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+    throw new Error("Minutes desktop app did not acknowledge the call recording request in time.");
+  } finally {
+    await rm(requestPath, { force: true }).catch(() => {});
+  }
+}
+
 const CLI_INSTALL_MSG =
   `Recording requires the minutes CLI binary.\n` +
   `Searched: ${MINUTES_BIN}\n\n` +
@@ -520,7 +621,7 @@ registerAppResource(
 
 server.tool(
  "start_recording",
-  "Start recording audio from the default input device. The recording runs until stop_recording is called.",
+  "Start recording audio with call-aware preflight. When a known call app is active, Minutes can infer call intent and block silent mic-only call captures unless explicitly allowed.",
   {
     title: z.string().optional().describe("Optional title for this recording"),
     mode: z
@@ -528,10 +629,19 @@ server.tool(
       .optional()
       .default("meeting")
       .describe("Live capture mode"),
+    intent: z
+      .enum(["memo", "room", "call"])
+      .optional()
+      .describe("Optional recording intent. If omitted and a known call app is active, Minutes may infer call intent."),
+    allow_degraded: z
+      .boolean()
+      .optional()
+      .default(false)
+      .describe("Allow a mic-only capture to continue even if Minutes detects a call but no system-audio route is configured."),
     language: z.string().optional().describe("Transcription language code (e.g. 'en', 'ur', 'es', 'zh'). Overrides config.toml setting."),
   },
   { title: "Start Recording", readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
-  async ({ title, mode, language }) => {
+  async ({ title, mode, intent, allow_degraded, language }) => {
     if (!(await isCliAvailable())) {
       return { content: [{ type: "text" as const, text: CLI_INSTALL_MSG }] };
     }
@@ -548,10 +658,62 @@ server.tool(
       };
     }
 
+    const preflightArgs = ["preflight-record", "--json", "--mode", mode, "--intent", intent || "auto"];
+    if (allow_degraded) preflightArgs.push("--allow-degraded");
+    const { stdout: preflightOut } = await runMinutes(preflightArgs);
+    const preflight = parseJsonOutput(preflightOut);
+
+    if (preflight.intent === "call") {
+      const response = await delegateCallRecordingToDesktop({
+        title,
+        mode,
+        intent: "call",
+        allow_degraded,
+        language,
+      });
+      if (response) {
+        if (!response.accepted) {
+          return {
+            content: [{ type: "text" as const, text: response.detail }],
+            structuredContent: { preflight, desktop_response: response },
+          };
+        }
+
+        await new Promise((r) => setTimeout(r, 750));
+        const { stdout: newStatus } = await runMinutes(["status"]);
+        const result = parseJsonOutput(newStatus);
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: result.recording
+                ? `Recording started in the running Minutes desktop app (PID: ${result.pid}).${Array.isArray(preflight.warnings) && preflight.warnings.length ? ` ${preflight.warnings[0]}` : ""} Say "stop recording" when done.`
+                : response.detail,
+            },
+          ],
+          structuredContent: { preflight, desktop_response: response },
+        };
+      }
+    }
+
+    if (preflight.blocking_reason) {
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: preflight.blocking_reason,
+          },
+        ],
+        structuredContent: { preflight },
+      };
+    }
+
     // Spawn detached — recording is a foreground process that blocks,
     // so we spawn it and let it run independently
     const args = ["record", "--mode", mode];
     if (title) args.push("--title", title);
+    if (intent) args.push("--intent", intent);
+    if (allow_degraded) args.push("--allow-degraded");
     if (language) args.push("--language", language);
 
     const child = spawn(MINUTES_BIN, args, {
@@ -572,7 +734,7 @@ server.tool(
         {
           type: "text" as const,
           text: result.recording
-            ? `${result.recording_mode === "quick-thought" ? "Quick thought" : "Recording"} started (PID: ${result.pid}). Say "stop recording" when done.`
+            ? `${result.recording_mode === "quick-thought" ? "Quick thought" : "Recording"} started (PID: ${result.pid}).${Array.isArray(preflight.warnings) && preflight.warnings.length ? ` ${preflight.warnings[0]}` : ""} Say "stop recording" when done.`
             : "Recording failed to start. Check `minutes logs` for details.",
         },
       ],
@@ -685,7 +847,7 @@ server.tool(
 
 server.tool(
   "list_processing_jobs",
-  "List background processing jobs for recent recordings, including queued, transcript-ready, failed, and completed work.",
+  "List background processing jobs for recent recordings, including queued, transcript-ready, needs-review, failed, and completed work.",
   {
     limit: z.number().optional().default(10).describe("Maximum number of jobs"),
     include_completed: z.boolean().optional().default(true).describe("Include completed and failed jobs"),

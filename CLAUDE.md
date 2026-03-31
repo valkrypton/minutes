@@ -38,6 +38,20 @@ cp target/release/minutes ~/.local/bin/minutes # Install CLI
 open target/release/bundle/macos/Minutes.app   # Launch app
 ```
 
+**Hard rule for macOS desktop packaging and dogfooding:**
+
+- If the work touches TCC-sensitive features, do **not** keep replacing `/Applications/Minutes.app` with local rebuilds.
+- Use `./scripts/install-dev-app.sh` and test `~/Applications/Minutes Dev.app`.
+- If a stable local codesigning identity exists, export `MINUTES_DEV_SIGNING_IDENTITY` before running the script.
+- On this machine, the preferred identity is:
+  - `Developer ID Application: Mathieu Silverstein (63TMLKT8HN)`
+- Example:
+
+```bash
+export MINUTES_DEV_SIGNING_IDENTITY="Developer ID Application: Mathieu Silverstein (63TMLKT8HN)"
+./scripts/install-dev-app.sh
+```
+
 **IMPORTANT**: After any code change, you must rebuild ALL affected targets:
 - CLI changes: `cargo build --release -p minutes-cli && cp target/release/minutes ~/.local/bin/minutes`
 - Tauri changes: `cargo tauri build --bundles app` then relaunch the appropriate app bundle
@@ -117,6 +131,7 @@ certificate or local notarization credentials.
 | **SDK rebuild** | Any change to `crates/sdk/src/` | `cd crates/sdk && npm run build` |
 | **Mutual exclusion** | Any change to recording/dictation/live transcript start paths | Verify all three modes check each other's PID/state: `live_transcript::run` checks recording+dictation PIDs, `cmd_record`/`capture::record_to_wav` checks live PID, `dictation::run` checks live PID, Tauri `cmd_start_*` checks `live_transcript_active`+`recording`+`dictation_active` |
 | **Tauri command duplication** | Changes to live transcript start/stop logic | Both `cmd_start_live_transcript` and `handle_live_shortcut_event` must use the shared `try_acquire_live` + `run_live_session` functions. Do NOT duplicate logic. |
+| **Desktop app identity** | Any Tauri packaging, dogfooding, Screen Recording, Input Monitoring, Accessibility, call capture, hotkey, or repeated-permission work | Use `./scripts/install-dev-app.sh`, not `rm -rf /Applications/Minutes.app && cp ...`. If a local signing identity exists, export `MINUTES_DEV_SIGNING_IDENTITY` first. Test `~/Applications/Minutes Dev.app`, not `/Applications/Minutes.app`. |
 | **README accuracy** | New/removed tools, features, crates, or CLI commands | Tool/resource counts, crate list in Architecture, feature sections, and CLI examples in README.md must reflect the current state. Check: tool count matches `manifest.json`, crate list matches `ls crates/*/`, module count matches `ls crates/core/src/*.rs` |
 | **npm dep versions** | Version bumps | `crates/mcp/package.json` `minutes-sdk` dep must reference a version that's actually published on npm. Check with `npm view minutes-sdk versions --json` |
 | **Release notes drafted** | Version bumps / releases | Every release is a visibility moment in followers' GitHub feeds. Draft compelling release notes BEFORE creating the release. No empty releases — ever. See Release Checklist step 5. |
@@ -131,6 +146,7 @@ certificate or local notarization credentials.
 # Bump in: Cargo.toml, crates/cli/Cargo.toml, tauri/src-tauri/tauri.conf.json,
 #          crates/mcp/package.json, crates/sdk/package.json, manifest.json
 # Also bump the version string in crates/mcp/src/index.ts (McpServer({ version }))
+# Also bump the minutes-core dep version in crates/cli/Cargo.toml
 # Verify:
 grep version Cargo.toml tauri/src-tauri/tauri.conf.json crates/mcp/package.json \
   crates/sdk/package.json manifest.json && grep 'version:' crates/mcp/src/index.ts
@@ -150,6 +166,14 @@ cd crates/mcp && npm run build       # MCP server + dashboard UI
 cargo fmt --all -- --check           # Rust formatting
 cargo clippy --all --no-default-features -- -D warnings  # Rust lints
 ```
+
+**macOS desktop note:**
+- For local TCC-sensitive dogfooding before release, rebuild the dev app with:
+```bash
+export MINUTES_DEV_SIGNING_IDENTITY="Developer ID Application: Mathieu Silverstein (63TMLKT8HN)"
+./scripts/install-dev-app.sh --no-open
+```
+- Do not treat a raw local `/Applications/Minutes.app` copy as the canonical test surface for permission-sensitive features.
 
 ### 5. Write release notes
 Every release shows up in followers' GitHub feeds — this is free awareness. Write notes BEFORE creating the release. No release should ever ship with an empty body.
@@ -184,6 +208,33 @@ cd site && npm install && vercel deploy --yes --prod --scope evil-genius-laborat
 ```
 
 ### 10. Update Homebrew tap formula if CLI changed
+The formula lives at `silverstein/homebrew-tap` → `Formula/minutes.rb`. Update the `tag:` to the new version:
+```bash
+# Fetch current SHA, update via GitHub API
+SHA=$(gh api repos/silverstein/homebrew-tap/contents/Formula/minutes.rb --jq '.sha')
+# Edit Formula/minutes.rb: change tag: "vX.Y.Z" → new version
+# Push via API or clone+commit+push
+```
+Verify: `brew update && brew info silverstein/tap/minutes` should show the new version.
+
+## GitHub Discussions
+
+Discussions are enabled at `silverstein/minutes` as the community Q&A surface. Issues are for bugs and feature requests; Discussions are for usage questions, setup help, and show-and-tell.
+
+**When to check Discussions:**
+- Before closing an issue that's really a question — convert it to a Discussion instead (`gh issue transfer` or manually)
+- When a bug report smells like a usage question (wrong device, config confusion, platform quirk) — answer and suggest reposting as a Discussion
+- After shipping a release — scan Q&A for questions the release may have answered, and reply with the fix/upgrade path
+
+**When to point users to Discussions:**
+- README and error messages that suggest "ask for help" should link to Discussions, not Issues
+- Issue templates should nudge Q&A to Discussions
+
+**Quick commands:**
+```bash
+gh api repos/silverstein/minutes/discussions --jq '.[].title'   # List recent
+gh issue list --label question                                    # Find issues that should be discussions
+```
 
 ## Project Structure
 

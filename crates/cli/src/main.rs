@@ -1,6 +1,7 @@
 use anyhow::Result;
 use chrono::{Local, TimeZone};
 use clap::{Parser, Subcommand};
+use minutes_core::capture::RecordingIntent;
 use minutes_core::{CaptureMode, Config, ContentType};
 use serde::Serialize;
 
@@ -36,6 +37,15 @@ enum Commands {
         #[arg(long, default_value = "meeting", value_parser = ["meeting", "quick-thought"])]
         mode: String,
 
+        /// Recording intent: auto, memo, room, or call.
+        #[arg(long, default_value = "auto", value_parser = ["auto", "memo", "room", "call"])]
+        intent: String,
+
+        /// Allow Minutes to continue with a mic-only capture even if a call
+        /// is detected and no system-audio route is configured.
+        #[arg(long)]
+        allow_degraded: bool,
+
         /// Transcription language (e.g. "en", "ur", "es"). Overrides config.toml setting.
         #[arg(short, long)]
         language: Option<String>,
@@ -62,6 +72,22 @@ enum Commands {
     /// Hidden worker that processes queued jobs.
     #[command(hide = true)]
     ProcessQueue,
+
+    /// Hidden preflight for call-aware recording start decisions.
+    #[command(hide = true)]
+    PreflightRecord {
+        #[arg(long, default_value = "meeting", value_parser = ["meeting", "quick-thought"])]
+        mode: String,
+
+        #[arg(long, default_value = "auto", value_parser = ["auto", "memo", "room", "call"])]
+        intent: String,
+
+        #[arg(long)]
+        allow_degraded: bool,
+
+        #[arg(long)]
+        json: bool,
+    },
 
     /// Check if a recording is in progress
     Status,
@@ -519,6 +545,8 @@ fn main() -> Result<()> {
             title,
             context,
             mode,
+            intent,
+            allow_degraded,
             language,
             device,
         } => {
@@ -528,11 +556,17 @@ fn main() -> Result<()> {
             if let Some(dev) = device {
                 config.recording.device = Some(dev);
             }
-            cmd_record(title, context, &mode, &config)
+            cmd_record(title, context, &mode, &intent, allow_degraded, &config)
         }
         Commands::Note { text, meeting } => cmd_note(&text, meeting.as_deref(), &config),
         Commands::Stop => cmd_stop(&config),
         Commands::ProcessQueue => cmd_process_queue(&config),
+        Commands::PreflightRecord {
+            mode,
+            intent,
+            allow_degraded,
+            json,
+        } => cmd_preflight_record(&mode, &intent, allow_degraded, json, &config),
         Commands::Status => cmd_status(),
         Commands::Jobs { all, json, limit } => cmd_jobs(all, json, limit),
         Commands::Paths { json } => cmd_paths(json, &config),
@@ -733,21 +767,85 @@ fn capture_mode_from_str(mode: &str) -> Result<CaptureMode> {
     }
 }
 
+fn parse_recording_intent(intent: &str) -> Result<Option<RecordingIntent>> {
+    match intent {
+        "auto" => Ok(None),
+        "memo" => Ok(Some(RecordingIntent::Memo)),
+        "room" => Ok(Some(RecordingIntent::Room)),
+        "call" => Ok(Some(RecordingIntent::Call)),
+        other => anyhow::bail!(
+            "unknown recording intent: {}. Use auto, memo, room, or call.",
+            other
+        ),
+    }
+}
+
 fn cleanup_live_capture_state() {
     minutes_core::pid::remove().ok();
     minutes_core::pid::clear_recording_metadata().ok();
     minutes_core::notes::cleanup();
 }
 
+fn cmd_preflight_record(
+    mode: &str,
+    intent: &str,
+    allow_degraded: bool,
+    json: bool,
+    config: &Config,
+) -> Result<()> {
+    let capture_mode = capture_mode_from_str(mode)?;
+    let requested_intent = parse_recording_intent(intent)?;
+    let preflight = minutes_core::capture::preflight_recording(
+        capture_mode,
+        requested_intent,
+        allow_degraded,
+        config,
+    )
+    .map_err(|error| anyhow::anyhow!("{}", error))?;
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&preflight)?);
+    } else if let Some(reason) = &preflight.blocking_reason {
+        anyhow::bail!("{}", reason);
+    } else {
+        println!(
+            "{} intent ready on '{}'.",
+            preflight.intent.as_str(),
+            preflight.input_device
+        );
+        for warning in &preflight.warnings {
+            eprintln!("warning: {}", warning);
+        }
+    }
+    Ok(())
+}
+
 fn cmd_record(
     title: Option<String>,
     context: Option<String>,
     mode: &str,
+    intent: &str,
+    allow_degraded: bool,
     config: &Config,
 ) -> Result<()> {
     // Ensure directories exist
     config.ensure_dirs()?;
     let capture_mode = capture_mode_from_str(mode)?;
+    let requested_intent = parse_recording_intent(intent)?;
+
+    let preflight = minutes_core::capture::preflight_recording(
+        capture_mode,
+        requested_intent,
+        allow_degraded,
+        config,
+    )
+    .map_err(|error| anyhow::anyhow!("{}", error))?;
+    if let Some(reason) = &preflight.blocking_reason {
+        anyhow::bail!("{}", reason);
+    }
+    for warning in &preflight.warnings {
+        eprintln!("[minutes] {}", warning);
+    }
 
     // Check for conflicting live transcript session
     let lt_pid = minutes_core::pid::live_transcript_pid_path();
@@ -811,13 +909,14 @@ fn cmd_record(
     let recording_finished_at = Local::now();
     let user_notes = minutes_core::notes::read_notes();
     let pre_context = minutes_core::notes::read_context();
-    let calendar_event = if capture_mode.content_type() == ContentType::Meeting {
-        minutes_core::calendar::events_overlapping_now()
-            .into_iter()
-            .next()
-    } else {
-        None
-    };
+    let calendar_event =
+        if capture_mode.content_type() == ContentType::Meeting && config.calendar.enabled {
+            minutes_core::calendar::events_overlapping_now()
+                .into_iter()
+                .next()
+        } else {
+            None
+        };
     let queued = (|| -> Result<(minutes_core::jobs::ProcessingJob, String)> {
         let job = minutes_core::jobs::queue_live_capture(
             capture_mode,
@@ -1044,6 +1143,7 @@ fn cmd_jobs(include_terminal: bool, json_mode: bool, limit: usize) -> Result<()>
             minutes_core::jobs::JobState::Diarizing => "diarizing",
             minutes_core::jobs::JobState::Summarizing => "summarizing",
             minutes_core::jobs::JobState::Saving => "saving",
+            minutes_core::jobs::JobState::NeedsReview => "needs-review",
             minutes_core::jobs::JobState::Complete => "complete",
             minutes_core::jobs::JobState::Failed => "failed",
         };

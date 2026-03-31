@@ -246,19 +246,21 @@ pub fn transcribe_to_artifact(
     };
 
     let write_result = if let Some(path) = existing_output_path {
-        markdown::rewrite(
+        markdown::rewrite_with_retry_path(
             path,
             &frontmatter,
             &transcript,
             None,
             context.user_notes.as_deref(),
+            Some(audio_path),
         )?
     } else {
-        markdown::write(
+        markdown::write_with_retry_path(
             &frontmatter,
             &transcript,
             None,
             context.user_notes.as_deref(),
+            Some(audio_path),
             config,
         )?
     };
@@ -480,12 +482,13 @@ where
     frontmatter.speaker_map = speaker_map;
 
     on_progress(PipelineStage::Saving);
-    let result = markdown::rewrite(
+    let result = markdown::rewrite_with_retry_path(
         &artifact.write_result.path,
         &frontmatter,
         &transcript,
         summary.as_deref(),
         context.user_notes.as_deref(),
+        Some(audio_path),
     )?;
 
     if !diarization_embeddings.is_empty() {
@@ -913,11 +916,12 @@ where
 
     tracing::info!(step = "write", "writing markdown");
     let step_start = std::time::Instant::now();
-    let result = markdown::write(
+    let result = markdown::write_with_retry_path(
         &frontmatter,
         &transcript,
         summary.as_deref(),
         user_notes.as_deref(),
+        Some(audio_path),
         config,
     )?;
     // Save per-speaker embeddings as sidecar (for Level 3 confirmed learning)

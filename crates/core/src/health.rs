@@ -33,7 +33,7 @@ pub fn check_all(config: &Config) -> Vec<HealthItem> {
         ffmpeg_status(),
         diarization_status(config),
         mic_status(),
-        calendar_status(),
+        calendar_status(config),
         watcher_status(config),
         output_dir_status(config),
         disk_space(config),
@@ -202,7 +202,15 @@ pub fn mic_status() -> HealthItem {
 }
 
 /// Check macOS calendar access (macOS only, returns unavailable on other platforms).
-pub fn calendar_status() -> HealthItem {
+pub fn calendar_status(config: &Config) -> HealthItem {
+    if !config.calendar.enabled {
+        return HealthItem {
+            label: "Calendar access".into(),
+            state: "ready".into(),
+            detail: "Calendar integration disabled. Enable with [calendar] enabled = true in config.toml.".into(),
+            optional: true,
+        };
+    }
     #[cfg(target_os = "macos")]
     {
         let mut cmd = std::process::Command::new("osascript");
@@ -221,7 +229,7 @@ pub fn calendar_status() -> HealthItem {
             Some(Err(_)) => HealthItem {
                 label: "Calendar access".into(),
                 state: "attention".into(),
-                detail: "Calendar access is unavailable. Meeting suggestions will be hidden."
+                detail: "Calendar access is unavailable. Meeting suggestions will be hidden. Disable with [calendar] enabled = false in config.toml."
                     .into(),
                 optional: true,
             },

@@ -160,7 +160,7 @@ fn render_markdown(
     transcript: &str,
     summary: Option<&str>,
     user_notes: Option<&str>,
-    path_for_no_speech_hint: &Path,
+    retry_audio_path: &Path,
 ) -> Result<String, MarkdownError> {
     let yaml = serde_yaml::to_string(frontmatter)
         .map_err(|e| MarkdownError::SerializationError(e.to_string()))?;
@@ -179,8 +179,12 @@ fn render_markdown(
             content.push_str(&format!("**Diagnosis**: {}\n\n", diagnosis));
         }
         content.push_str(&format!(
-            "To retry with a different model:\n`minutes process {} --model large-v3`\n\n",
-            path_for_no_speech_hint.display()
+            "**Retry audio**: `{}`\n\n",
+            retry_audio_path.display()
+        ));
+        content.push_str(&format!(
+            "To retry after adjusting your transcription settings:\n`minutes process {}`\n\n",
+            retry_audio_path.display()
         ));
     }
 
@@ -210,6 +214,18 @@ pub fn write(
     user_notes: Option<&str>,
     config: &Config,
 ) -> Result<WriteResult, MarkdownError> {
+    write_with_retry_path(frontmatter, transcript, summary, user_notes, None, config)
+}
+
+/// Write markdown while pointing no-speech retry guidance at the original audio path.
+pub fn write_with_retry_path(
+    frontmatter: &Frontmatter,
+    transcript: &str,
+    summary: Option<&str>,
+    user_notes: Option<&str>,
+    retry_audio_path: Option<&Path>,
+    config: &Config,
+) -> Result<WriteResult, MarkdownError> {
     let output_dir = match frontmatter.r#type {
         ContentType::Memo => config.output_dir.join("memos"),
         ContentType::Meeting => config.output_dir.clone(),
@@ -227,7 +243,13 @@ pub fn write(
         frontmatter.recorded_by.as_deref(),
     );
     let path = resolve_collision(&output_dir, &slug);
-    let content = render_markdown(frontmatter, transcript, summary, user_notes, &path)?;
+    let content = render_markdown(
+        frontmatter,
+        transcript,
+        summary,
+        user_notes,
+        retry_audio_path.unwrap_or(&path),
+    )?;
 
     // Write file with appropriate permissions
     fs::write(&path, &content)?;
@@ -260,7 +282,24 @@ pub fn rewrite(
     summary: Option<&str>,
     user_notes: Option<&str>,
 ) -> Result<WriteResult, MarkdownError> {
-    let content = render_markdown(frontmatter, transcript, summary, user_notes, path)?;
+    rewrite_with_retry_path(path, frontmatter, transcript, summary, user_notes, None)
+}
+
+pub fn rewrite_with_retry_path(
+    path: &Path,
+    frontmatter: &Frontmatter,
+    transcript: &str,
+    summary: Option<&str>,
+    user_notes: Option<&str>,
+    retry_audio_path: Option<&Path>,
+) -> Result<WriteResult, MarkdownError> {
+    let content = render_markdown(
+        frontmatter,
+        transcript,
+        summary,
+        user_notes,
+        retry_audio_path.unwrap_or(path),
+    )?;
     let tmp = path.with_extension("md.tmp");
     fs::write(&tmp, content)?;
     let mode = match frontmatter.visibility {
@@ -655,6 +694,7 @@ mod tests {
             output_dir: dir.path().to_path_buf(),
             ..Config::default()
         };
+        let audio = dir.path().join("capture.wav");
 
         let fm = Frontmatter {
             status: Some(OutputStatus::NoSpeech),
@@ -662,11 +702,12 @@ mod tests {
             ..test_frontmatter()
         };
 
-        let result = write(&fm, "", None, None, &config).unwrap();
+        let result = write_with_retry_path(&fm, "", None, None, Some(&audio), &config).unwrap();
         let content = fs::read_to_string(&result.path).unwrap();
         assert!(content.contains("No speech detected"));
         assert!(content.contains("**Diagnosis**:"));
         assert!(content.contains("no_speech filter"));
+        assert!(content.contains(audio.display().to_string().as_str()));
         assert!(content.contains("minutes process"));
     }
 }

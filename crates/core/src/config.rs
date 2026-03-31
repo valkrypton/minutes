@@ -21,6 +21,7 @@ pub struct Config {
     pub watch: WatchConfig,
     pub assistant: AssistantConfig,
     pub screen_context: ScreenContextConfig,
+    pub calendar: CalendarConfig,
     pub call_detection: CallDetectionConfig,
     pub identity: IdentityConfig,
     pub vault: VaultConfig,
@@ -141,6 +142,18 @@ pub struct AssistantConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
+pub struct CalendarConfig {
+    pub enabled: bool,
+}
+
+impl Default for CalendarConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct CallDetectionConfig {
     pub enabled: bool,
     pub poll_interval_secs: u64,
@@ -232,6 +245,11 @@ pub struct RecordingConfig {
     /// Audio input device name override. When set, Minutes uses this device
     /// instead of the system default. Use `minutes devices` to list available names.
     pub device: Option<String>,
+    /// Automatically infer call intent when a known call app is active.
+    pub auto_call_intent: bool,
+    /// Allow Minutes to start a call capture even when the selected input
+    /// looks like a plain microphone rather than a system-audio route.
+    pub allow_degraded_call_capture: bool,
 }
 
 impl Default for RecordingConfig {
@@ -240,6 +258,8 @@ impl Default for RecordingConfig {
             silence_reminder_secs: 300,
             silence_threshold: 3,
             device: None,
+            auto_call_intent: true,
+            allow_degraded_call_capture: false,
         }
     }
 }
@@ -294,8 +314,8 @@ impl Default for AssistantConfig {
 impl Default for CallDetectionConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
-            poll_interval_secs: 3,
+            enabled: true,
+            poll_interval_secs: 1,
             cooldown_minutes: 5,
             apps: vec![
                 "zoom.us".into(),
@@ -341,6 +361,7 @@ impl Default for Config {
             watch: WatchConfig::default(),
             assistant: AssistantConfig::default(),
             screen_context: ScreenContextConfig::default(),
+            calendar: CalendarConfig::default(),
             call_detection: CallDetectionConfig::default(),
             identity: IdentityConfig::default(),
             vault: VaultConfig::default(),
@@ -565,8 +586,11 @@ mod tests {
         assert_eq!(config.search.engine, "builtin");
         assert!(!config.daily_notes.enabled);
         assert!(config.dictation.accumulate);
+        assert!(config.call_detection.enabled);
         assert_eq!(config.watch.settle_delay_ms, 2000);
         assert!(!config.watch.extensions.is_empty());
+        assert!(config.recording.auto_call_intent);
+        assert!(!config.recording.allow_degraded_call_capture);
     }
 
     #[test]

@@ -1,5 +1,6 @@
 use crate::config::Config;
 use crate::error::CaptureError;
+use crate::pid::CaptureMode;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
@@ -11,6 +12,35 @@ static AUDIO_LEVEL: AtomicU32 = AtomicU32::new(0);
 /// Get the current audio input level (0–100).
 pub fn audio_level() -> u32 {
     AUDIO_LEVEL.load(Ordering::Relaxed)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RecordingIntent {
+    Memo,
+    Room,
+    Call,
+}
+
+impl RecordingIntent {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Memo => "memo",
+            Self::Room => "room",
+            Self::Call => "call",
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CapturePreflight {
+    pub intent: RecordingIntent,
+    pub inferred_call_app: Option<String>,
+    pub input_device: String,
+    pub system_audio_ready: bool,
+    pub allow_degraded: bool,
+    pub blocking_reason: Option<String>,
+    pub warnings: Vec<String>,
 }
 
 // ──────────────────────────────────────────────────────────────
@@ -606,6 +636,173 @@ pub fn get_macos_default_input_name() -> Option<String> {
     None
 }
 
+fn detect_call_app_from_processes(
+    running: &[String],
+    config: &crate::config::CallDetectionConfig,
+) -> Option<String> {
+    for config_app in &config.apps {
+        let config_lower = config_app.to_lowercase();
+        if running.iter().any(|process_name| {
+            let process_lower = process_name.to_lowercase();
+            process_lower.contains(&config_lower) || config_lower.contains(&process_lower)
+        }) {
+            return Some(match config_app.as_str() {
+                "zoom.us" => "Zoom".into(),
+                "Microsoft Teams" | "Microsoft Teams (work or school)" => "Teams".into(),
+                "FaceTime" => "FaceTime".into(),
+                "Webex" => "Webex".into(),
+                "Slack" => "Slack".into(),
+                other => other.into(),
+            });
+        }
+    }
+    None
+}
+
+fn running_process_names() -> Vec<String> {
+    let output = std::process::Command::new("ps")
+        .args(["-eo", "comm="])
+        .output();
+
+    match output {
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|line| {
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    return None;
+                }
+                Some(trimmed.rsplit('/').next().unwrap_or(trimmed).to_string())
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+pub fn detect_active_call_app(config: &Config) -> Option<String> {
+    detect_call_app_from_processes(&running_process_names(), &config.call_detection)
+}
+
+pub fn is_system_audio_device_name(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    [
+        "blackhole",
+        "loopback",
+        "soundflower",
+        "vb-cable",
+        "stereo mix",
+        "multi-output",
+        "aggregate",
+    ]
+    .iter()
+    .any(|hint| lower.contains(hint))
+}
+
+pub fn selected_input_device_name(config: &Config) -> Result<String, CaptureError> {
+    use cpal::traits::DeviceTrait;
+
+    let host = cpal::default_host();
+    let device = select_input_device(&host, config.recording.device.as_deref())?;
+    device
+        .name()
+        .map_err(|error| CaptureError::Io(std::io::Error::other(error.to_string())))
+}
+
+fn infer_recording_intent(
+    mode: CaptureMode,
+    requested_intent: Option<RecordingIntent>,
+    detected_call_app: Option<&str>,
+    config: &Config,
+) -> Result<RecordingIntent, String> {
+    if mode == CaptureMode::QuickThought {
+        if let Some(intent) = requested_intent {
+            if intent != RecordingIntent::Memo {
+                return Err(
+                    "Quick thoughts only support memo intent. Use meeting mode for room or call capture."
+                        .into(),
+                );
+            }
+        }
+        return Ok(RecordingIntent::Memo);
+    }
+
+    if let Some(intent) = requested_intent {
+        return Ok(intent);
+    }
+
+    if config.recording.auto_call_intent && detected_call_app.is_some() {
+        Ok(RecordingIntent::Call)
+    } else {
+        Ok(RecordingIntent::Room)
+    }
+}
+
+fn evaluate_capture_preflight(
+    mode: CaptureMode,
+    requested_intent: Option<RecordingIntent>,
+    detected_call_app: Option<String>,
+    input_device: String,
+    allow_degraded: bool,
+    config: &Config,
+) -> Result<CapturePreflight, String> {
+    let intent =
+        infer_recording_intent(mode, requested_intent, detected_call_app.as_deref(), config)?;
+    let system_audio_ready = is_system_audio_device_name(&input_device);
+    let allow_degraded = allow_degraded || config.recording.allow_degraded_call_capture;
+    let mut warnings = Vec::new();
+    let mut blocking_reason = None;
+
+    if intent == RecordingIntent::Call {
+        if let Some(app_name) = detected_call_app.as_deref() {
+            warnings.push(format!("Detected active {} call.", app_name));
+        }
+        if system_audio_ready {
+            warnings.push(format!(
+                "Using '{}' as the input route for call capture.",
+                input_device
+            ));
+        } else if allow_degraded {
+            warnings.push(format!(
+                "Starting degraded call capture from '{}'. This will likely miss the remote side of the call.",
+                input_device
+            ));
+        } else {
+            blocking_reason = Some(format!(
+                "Minutes inferred a call capture, but '{}' looks like a microphone input, not a call-audio route. To record both sides, use the desktop app's native call capture path or choose a system-audio device like BlackHole. If you intentionally want mic-only capture, explicitly allow degraded call capture.",
+                input_device
+            ));
+        }
+    }
+
+    Ok(CapturePreflight {
+        intent,
+        inferred_call_app: detected_call_app,
+        input_device,
+        system_audio_ready,
+        allow_degraded,
+        blocking_reason,
+        warnings,
+    })
+}
+
+pub fn preflight_recording(
+    mode: CaptureMode,
+    requested_intent: Option<RecordingIntent>,
+    allow_degraded: bool,
+    config: &Config,
+) -> Result<CapturePreflight, String> {
+    let detected_call_app = detect_active_call_app(config);
+    let input_device = selected_input_device_name(config).map_err(|error| error.to_string())?;
+    evaluate_capture_preflight(
+        mode,
+        requested_intent,
+        detected_call_app,
+        input_device,
+        allow_degraded,
+        config,
+    )
+}
+
 /// Send a macOS notification when silence is detected during recording.
 fn send_silence_notification(silent_secs: u64) {
     let minutes = silent_secs / 60;
@@ -696,4 +893,76 @@ pub fn list_input_devices() -> Vec<String> {
     }
 
     devices
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detect_call_app_matches_configured_processes() {
+        let running = vec![
+            "/Applications/Microsoft Teams.app/Contents/MacOS/Microsoft Teams".to_string(),
+            "/System/Library/CoreServices/Finder.app/Contents/MacOS/Finder".to_string(),
+        ];
+        let config = crate::config::CallDetectionConfig::default();
+
+        let detected = detect_call_app_from_processes(&running, &config);
+
+        assert_eq!(detected.as_deref(), Some("Teams"));
+    }
+
+    #[test]
+    fn evaluate_capture_preflight_blocks_plain_mic_for_call_intent() {
+        let config = Config::default();
+        let preflight = evaluate_capture_preflight(
+            CaptureMode::Meeting,
+            Some(RecordingIntent::Call),
+            Some("Teams".into()),
+            "Built-in Microphone".into(),
+            false,
+            &config,
+        )
+        .unwrap();
+
+        assert_eq!(preflight.intent, RecordingIntent::Call);
+        assert!(!preflight.system_audio_ready);
+        assert!(preflight.blocking_reason.is_some());
+    }
+
+    #[test]
+    fn evaluate_capture_preflight_allows_known_system_audio_route() {
+        let config = Config::default();
+        let preflight = evaluate_capture_preflight(
+            CaptureMode::Meeting,
+            Some(RecordingIntent::Call),
+            Some("Zoom".into()),
+            "BlackHole 2ch".into(),
+            false,
+            &config,
+        )
+        .unwrap();
+
+        assert!(preflight.system_audio_ready);
+        assert!(preflight.blocking_reason.is_none());
+        assert!(!preflight.warnings.is_empty());
+    }
+
+    #[test]
+    fn evaluate_capture_preflight_honors_degraded_override() {
+        let config = Config::default();
+        let preflight = evaluate_capture_preflight(
+            CaptureMode::Meeting,
+            Some(RecordingIntent::Call),
+            Some("Meet".into()),
+            "Built-in Microphone".into(),
+            true,
+            &config,
+        )
+        .unwrap();
+
+        assert!(preflight.blocking_reason.is_none());
+        assert!(preflight.allow_degraded);
+        assert!(!preflight.warnings.is_empty());
+    }
 }

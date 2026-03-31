@@ -12,6 +12,17 @@ bd close <id>         # Complete work
 bd dolt push          # Push beads data to remote
 ```
 
+## GitHub Discussions
+
+This repo has GitHub Discussions enabled (`silverstein/minutes`). Issues are for bugs and feature requests. Discussions are for usage questions, setup help, and community show-and-tell.
+
+**Agent guidelines:**
+- When triaging an issue that's really a "how do I...?" question, suggest converting it to a Discussion rather than closing it
+- When a user's bug report turns out to be a config/setup issue, answer it and note that Discussions is the better venue for follow-ups
+- After shipping a feature or fix, check if any open Q&A discussions are resolved by the change — post a reply pointing to the release
+- When writing user-facing error messages or help text, link to Discussions (not Issues) for support: `https://github.com/silverstein/minutes/discussions`
+- Don't file Discussions as work items — they're community conversations, not tracked tasks
+
 ## Non-Interactive Shell Commands
 
 **ALWAYS use non-interactive flags** with file operations to avoid hanging on confirmation prompts.
@@ -35,6 +46,30 @@ cp -rf source dest          # NOT: cp -r source dest
 - `ssh` - use `-o BatchMode=yes` to fail instead of prompting
 - `apt-get` - use `-y` flag
 - `brew` - use `HOMEBREW_NO_AUTO_UPDATE=1` env var
+
+## macOS Desktop Identity Rule
+
+For any local desktop work that touches macOS privacy / TCC-sensitive features
+(Microphone, Screen Recording, Input Monitoring, Accessibility, call capture,
+global hotkeys), do **not** dogfood by repeatedly replacing
+`/Applications/Minutes.app` with ad-hoc local rebuilds.
+
+Use the dedicated development app identity instead:
+
+```bash
+export MINUTES_DEV_SIGNING_IDENTITY="Developer ID Application: Mathieu Silverstein (63TMLKT8HN)"
+./scripts/install-dev-app.sh
+```
+
+Canonical dogfood target:
+
+- `~/Applications/Minutes Dev.app`
+
+Why:
+
+- macOS TCC permissions attach to the effective app identity and signature
+- ad-hoc local rebuilds of `/Applications/Minutes.app` can trigger repeated or misleading permission prompts
+- the signed dev app is the stable local identity for permission-sensitive testing
 
 <!-- BEGIN BEADS INTEGRATION profile:full hash:d4f96305 -->
 ## Issue Tracking with bd (beads)

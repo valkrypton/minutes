@@ -1,12 +1,15 @@
+use crate::call_capture;
+use minutes_core::capture::RecordingIntent;
 use minutes_core::{CaptureMode, Config, ContentType};
 use std::cmp::Reverse;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 use tauri::{Emitter, Manager};
 use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
+use tauri_plugin_notification::NotificationExt;
 use tauri_plugin_shell::ShellExt;
 
 pub struct AppState {
@@ -16,6 +19,7 @@ pub struct AppState {
     pub processing: Arc<AtomicBool>,
     pub processing_stage: Arc<Mutex<Option<String>>>,
     pub latest_output: Arc<Mutex<Option<OutputNotice>>>,
+    pub call_capture_health: Arc<Mutex<Option<crate::call_capture::CallSourceHealth>>>,
     pub completion_notifications_enabled: Arc<AtomicBool>,
     pub global_hotkey_enabled: Arc<AtomicBool>,
     pub global_hotkey_shortcut: Arc<Mutex<String>>,
@@ -136,6 +140,7 @@ fn processing_job_view(job: minutes_core::jobs::ProcessingJob) -> ProcessingJobV
             minutes_core::jobs::JobState::Diarizing => "diarizing".into(),
             minutes_core::jobs::JobState::Summarizing => "summarizing".into(),
             minutes_core::jobs::JobState::Saving => "saving".into(),
+            minutes_core::jobs::JobState::NeedsReview => "needs-review".into(),
             minutes_core::jobs::JobState::Complete => "complete".into(),
             minutes_core::jobs::JobState::Failed => "failed".into(),
         },
@@ -376,6 +381,256 @@ fn preserve_failed_capture(wav_path: &std::path::Path, config: &Config) -> Optio
     Some(dest)
 }
 
+fn preserve_failed_capture_path(path: &std::path::Path, config: &Config) -> Option<PathBuf> {
+    let metadata = path.metadata().ok()?;
+    if metadata.len() == 0 {
+        return None;
+    }
+
+    let dir = config.output_dir.join("failed-captures");
+    std::fs::create_dir_all(&dir).ok()?;
+    let ext = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+        .unwrap_or("bin");
+    let dest = dir.join(format!(
+        "{}-capture.{}",
+        chrono::Local::now().format("%Y-%m-%d-%H%M%S"),
+        ext
+    ));
+
+    std::fs::copy(path, &dest).ok()?;
+    std::fs::remove_file(path).ok();
+    Some(dest)
+}
+
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+fn start_native_call_recording(
+    app_handle: &tauri::AppHandle,
+    recording: &Arc<AtomicBool>,
+    starting: &Arc<AtomicBool>,
+    stop_flag: &Arc<AtomicBool>,
+    processing: &Arc<AtomicBool>,
+    processing_stage: &Arc<Mutex<Option<String>>>,
+    latest_output: &Arc<Mutex<Option<OutputNotice>>>,
+    call_capture_health: &Arc<Mutex<Option<crate::call_capture::CallSourceHealth>>>,
+    completion_notifications_enabled: &Arc<AtomicBool>,
+    hotkey_runtime: Option<&Arc<Mutex<HotkeyRuntime>>>,
+    discard_short_hotkey_capture: Option<&Arc<AtomicBool>>,
+    mode: CaptureMode,
+    config: &Config,
+    requested_title: Option<String>,
+) -> Result<(), String> {
+    minutes_core::pid::create().map_err(|error| error.to_string())?;
+    let mut session = match call_capture::start_native_call_capture() {
+        Ok(session) => session,
+        Err(error) => {
+            minutes_core::pid::remove().ok();
+            return Err(error);
+        }
+    };
+    let output_path = session.output_path().to_path_buf();
+    let recording_started_at = chrono::Local::now();
+
+    starting.store(false, Ordering::Relaxed);
+    recording.store(true, Ordering::Relaxed);
+    stop_flag.store(false, Ordering::Relaxed);
+    sync_processing_indicator(processing, processing_stage);
+    set_latest_output(latest_output, None);
+    if let Ok(mut health) = call_capture_health.lock() {
+        *health = Some(session.source_health());
+    }
+    minutes_core::pid::write_recording_metadata(mode).ok();
+    crate::update_tray_state(app_handle, true);
+    minutes_core::notes::save_recording_start().ok();
+
+    eprintln!(
+        "[minutes] Native call capture started: {}",
+        output_path.display()
+    );
+
+    while !stop_flag.load(Ordering::Relaxed) {
+        std::thread::sleep(Duration::from_millis(100));
+        if minutes_core::pid::check_and_clear_sentinel() {
+            break;
+        }
+        if let Some(status) = session.try_wait()? {
+            if let Ok(mut health) = call_capture_health.lock() {
+                *health = Some(session.source_health());
+            }
+            if !status.success() {
+                let preserved = preserve_failed_capture_path(&output_path, config);
+                minutes_core::pid::remove().ok();
+                minutes_core::pid::clear_recording_metadata().ok();
+                minutes_core::notes::cleanup();
+                recording.store(false, Ordering::Relaxed);
+                starting.store(false, Ordering::Relaxed);
+                if let Ok(mut health) = call_capture_health.lock() {
+                    *health = None;
+                }
+                if let Some(saved) = preserved {
+                    let notice = OutputNotice {
+                        kind: "preserved-capture".into(),
+                        title: "Native call capture failed".into(),
+                        path: saved.display().to_string(),
+                        detail:
+                            "ScreenCaptureKit capture ended early, but the raw output was preserved."
+                                .into(),
+                    };
+                    set_latest_output(latest_output, Some(notice.clone()));
+                    maybe_show_completion_notification(
+                        app_handle,
+                        completion_notifications_enabled,
+                        &notice,
+                    );
+                }
+                reset_hotkey_capture_state(hotkey_runtime, discard_short_hotkey_capture);
+                return Ok(());
+            }
+            break;
+        }
+    }
+
+    if let Err(error) = session.stop() {
+        let preserved = preserve_failed_capture_path(&output_path, config);
+        minutes_core::notes::cleanup();
+        minutes_core::pid::remove().ok();
+        minutes_core::pid::clear_recording_metadata().ok();
+        processing.store(false, Ordering::Relaxed);
+        set_processing_stage(processing_stage, None);
+        starting.store(false, Ordering::Relaxed);
+        recording.store(false, Ordering::Relaxed);
+        if let Ok(mut health) = call_capture_health.lock() {
+            *health = None;
+        }
+        if let Some(saved) = preserved {
+            let notice = OutputNotice {
+                kind: "preserved-capture".into(),
+                title: "Native call capture preserved".into(),
+                path: saved.display().to_string(),
+                detail: format!("Stopping native call capture failed: {}", error),
+            };
+            set_latest_output(latest_output, Some(notice.clone()));
+            maybe_show_completion_notification(
+                app_handle,
+                completion_notifications_enabled,
+                &notice,
+            );
+        }
+        reset_hotkey_capture_state(hotkey_runtime, discard_short_hotkey_capture);
+        return Ok(());
+    }
+
+    recording.store(false, Ordering::Relaxed);
+    if let Ok(mut health) = call_capture_health.lock() {
+        *health = Some(session.source_health());
+    }
+    let should_discard = discard_short_hotkey_capture
+        .as_ref()
+        .map(|flag| flag.swap(false, Ordering::Relaxed))
+        .unwrap_or(false);
+    if should_discard {
+        if output_path.exists() {
+            std::fs::remove_file(&output_path).ok();
+        }
+        minutes_core::notes::cleanup();
+        minutes_core::pid::remove().ok();
+        minutes_core::pid::clear_recording_metadata().ok();
+        starting.store(false, Ordering::Relaxed);
+        if let Ok(mut health) = call_capture_health.lock() {
+            *health = None;
+        }
+        reset_hotkey_capture_state(hotkey_runtime, discard_short_hotkey_capture);
+        return Ok(());
+    }
+
+    let recording_finished_at = chrono::Local::now();
+    let user_notes = minutes_core::notes::read_notes();
+    let pre_context = minutes_core::notes::read_context();
+    let calendar_event = if mode.content_type() == ContentType::Meeting && config.calendar.enabled {
+        minutes_core::calendar::events_overlapping_now()
+            .into_iter()
+            .next()
+    } else {
+        None
+    };
+
+    match minutes_core::jobs::enqueue_capture_job(
+        mode,
+        requested_title,
+        output_path.clone(),
+        user_notes,
+        pre_context,
+        Some(recording_started_at),
+        Some(recording_finished_at),
+        calendar_event,
+    ) {
+        Ok(job) => {
+            processing.store(true, Ordering::Relaxed);
+            set_processing_stage(processing_stage, job.stage.as_deref());
+            minutes_core::pid::set_processing_status(
+                job.stage.as_deref(),
+                Some(mode),
+                job.title.as_deref(),
+                Some(&job.id),
+                minutes_core::jobs::active_job_count(),
+            )
+            .ok();
+            minutes_core::pid::remove().ok();
+            minutes_core::pid::clear_recording_metadata().ok();
+            minutes_core::notes::cleanup();
+            if let Ok(mut health) = call_capture_health.lock() {
+                *health = Some(session.source_health());
+            }
+            spawn_processing_worker(
+                app_handle.clone(),
+                processing.clone(),
+                processing_stage.clone(),
+                latest_output.clone(),
+                completion_notifications_enabled.clone(),
+            );
+            sync_processing_indicator(processing, processing_stage);
+        }
+        Err(error) => {
+            let preserved = preserve_failed_capture_path(&output_path, config);
+            minutes_core::notes::cleanup();
+            minutes_core::pid::remove().ok();
+            minutes_core::pid::clear_recording_metadata().ok();
+            processing.store(false, Ordering::Relaxed);
+            set_processing_stage(processing_stage, None);
+            if let Ok(mut health) = call_capture_health.lock() {
+                *health = None;
+            }
+            if let Some(saved) = preserved {
+                let notice = OutputNotice {
+                    kind: "preserved-capture".into(),
+                    title: "Native call capture preserved".into(),
+                    path: saved.display().to_string(),
+                    detail: format!(
+                        "Failed to queue native call capture for processing: {}",
+                        error
+                    ),
+                };
+                set_latest_output(latest_output, Some(notice.clone()));
+                maybe_show_completion_notification(
+                    app_handle,
+                    completion_notifications_enabled,
+                    &notice,
+                );
+            }
+            starting.store(false, Ordering::Relaxed);
+            reset_hotkey_capture_state(hotkey_runtime, discard_short_hotkey_capture);
+            return Ok(());
+        }
+    }
+
+    starting.store(false, Ordering::Relaxed);
+    reset_hotkey_capture_state(hotkey_runtime, discard_short_hotkey_capture);
+    Ok(())
+}
+
 pub fn recording_active(recording: &Arc<AtomicBool>) -> bool {
     recording.load(Ordering::Relaxed) || minutes_core::pid::status().recording
 }
@@ -450,6 +705,19 @@ fn parse_capture_mode(mode: Option<&str>) -> Result<CaptureMode, String> {
     }
 }
 
+fn parse_recording_intent(intent: Option<&str>) -> Result<Option<RecordingIntent>, String> {
+    match intent.unwrap_or("auto") {
+        "auto" => Ok(None),
+        "memo" => Ok(Some(RecordingIntent::Memo)),
+        "room" => Ok(Some(RecordingIntent::Room)),
+        "call" => Ok(Some(RecordingIntent::Call)),
+        other => Err(format!(
+            "Unsupported recording intent: {}. Use auto, memo, room, or call.",
+            other
+        )),
+    }
+}
+
 #[cfg(test)]
 fn stage_label(stage: minutes_core::pipeline::PipelineStage, mode: CaptureMode) -> &'static str {
     match (stage, mode) {
@@ -512,6 +780,17 @@ fn sync_processing_indicator(
 
 fn output_notice_from_job(job: &minutes_core::jobs::ProcessingJob) -> Option<OutputNotice> {
     match job.state {
+        minutes_core::jobs::JobState::NeedsReview => Some(OutputNotice {
+            kind: "preserved-capture".into(),
+            title: job
+                .title
+                .clone()
+                .unwrap_or_else(|| "Recording needs review".into()),
+            path: job.audio_path.clone(),
+            detail: job.error.clone().unwrap_or_else(|| {
+                "Transcript was marked as no speech. Raw capture preserved for retry.".into()
+            }),
+        }),
         minutes_core::jobs::JobState::Complete => {
             job.output_path.as_ref().map(|path| OutputNotice {
                 kind: "saved".into(),
@@ -637,6 +916,32 @@ fn maybe_show_completion_notification(
 }
 
 pub fn show_user_notification(app_handle: &tauri::AppHandle, title: &str, body: &str) {
+    #[cfg(target_os = "macos")]
+    {
+        let identifier = app_handle.config().identifier.as_str();
+        let _ = notify_rust::set_application(identifier);
+
+        let mut notification = notify_rust::Notification::new();
+        notification.summary(title);
+        notification.body(body);
+        notification.auto_icon();
+
+        if notification.show().is_ok() {
+            return;
+        }
+    }
+
+    let plugin_notification_result = app_handle
+        .notification()
+        .builder()
+        .title(title)
+        .body(body)
+        .show();
+
+    if plugin_notification_result.is_ok() {
+        return;
+    }
+
     #[cfg(target_os = "macos")]
     {
         let script = format!(
@@ -908,6 +1213,38 @@ fn microphone_status() -> ReadinessItem {
             "No audio input devices detected. Check hardware and system audio settings.".into()
         },
         optional: false,
+    }
+}
+
+fn call_capture_status() -> ReadinessItem {
+    match call_capture::availability() {
+        call_capture::CallCaptureAvailability::Available { backend } => ReadinessItem {
+            label: "Call capture".into(),
+            state: "ready".into(),
+            detail: format!(
+                "Native call capture is available via {}. Screen Recording permission will be requested when capture actually starts if macOS still needs it.",
+                backend
+            ),
+            optional: true,
+        },
+        call_capture::CallCaptureAvailability::PermissionRequired { detail } => ReadinessItem {
+            label: "Call capture".into(),
+            state: "attention".into(),
+            detail,
+            optional: true,
+        },
+        call_capture::CallCaptureAvailability::Unavailable { detail } => ReadinessItem {
+            label: "Call capture".into(),
+            state: "attention".into(),
+            detail,
+            optional: true,
+        },
+        call_capture::CallCaptureAvailability::Unsupported { detail } => ReadinessItem {
+            label: "Call capture".into(),
+            state: "unsupported".into(),
+            detail,
+            optional: true,
+        },
     }
 }
 
@@ -1269,12 +1606,102 @@ pub fn start_recording(
     processing: Arc<AtomicBool>,
     processing_stage: Arc<Mutex<Option<String>>>,
     latest_output: Arc<Mutex<Option<OutputNotice>>>,
+    call_capture_health: Arc<Mutex<Option<crate::call_capture::CallSourceHealth>>>,
     completion_notifications_enabled: Arc<AtomicBool>,
     hotkey_runtime: Option<Arc<Mutex<HotkeyRuntime>>>,
     discard_short_hotkey_capture: Option<Arc<AtomicBool>>,
     mode: CaptureMode,
+    requested_intent: Option<RecordingIntent>,
+    allow_degraded: bool,
+    requested_title: Option<String>,
+    language_override: Option<String>,
 ) {
-    let config = Config::load();
+    let mut config = Config::load();
+    if let Some(language) = language_override {
+        config.transcription.language = Some(language);
+    }
+    let preflight = match minutes_core::capture::preflight_recording(
+        mode,
+        requested_intent,
+        allow_degraded,
+        &config,
+    ) {
+        Ok(preflight) => preflight,
+        Err(error) => {
+            eprintln!("Recording preflight failed: {}", error);
+            show_user_notification(&app_handle, "Recording blocked", &error);
+            starting.store(false, Ordering::Relaxed);
+            recording.store(false, Ordering::Relaxed);
+            reset_hotkey_capture_state(
+                hotkey_runtime.as_ref(),
+                discard_short_hotkey_capture.as_ref(),
+            );
+            return;
+        }
+    };
+    let native_call_capture_available = preflight.intent == RecordingIntent::Call
+        && matches!(
+            call_capture::availability(),
+            call_capture::CallCaptureAvailability::Available { .. }
+        );
+    if let Some(reason) = &preflight.blocking_reason {
+        if !(preflight.intent == RecordingIntent::Call && native_call_capture_available) {
+            eprintln!("Recording preflight blocked: {}", reason);
+            show_user_notification(&app_handle, "Recording blocked", reason);
+            starting.store(false, Ordering::Relaxed);
+            recording.store(false, Ordering::Relaxed);
+            reset_hotkey_capture_state(
+                hotkey_runtime.as_ref(),
+                discard_short_hotkey_capture.as_ref(),
+            );
+            return;
+        }
+    }
+    for warning in &preflight.warnings {
+        eprintln!("[minutes] {}", warning);
+    }
+
+    #[cfg(target_os = "macos")]
+    if preflight.intent == RecordingIntent::Call && native_call_capture_available {
+        match start_native_call_recording(
+            &app_handle,
+            &recording,
+            &starting,
+            &stop_flag,
+            &processing,
+            &processing_stage,
+            &latest_output,
+            &call_capture_health,
+            &completion_notifications_enabled,
+            hotkey_runtime.as_ref(),
+            discard_short_hotkey_capture.as_ref(),
+            mode,
+            &config,
+            requested_title.clone(),
+        ) {
+            Ok(()) => {
+                return;
+            }
+            Err(error) => {
+                eprintln!("Native call recording unavailable, falling back: {}", error);
+                if let Some(reason) = &preflight.blocking_reason {
+                    show_user_notification(
+                        &app_handle,
+                        "Recording blocked",
+                        &format!("{}\n\nNative call capture failed: {}", reason, error),
+                    );
+                    starting.store(false, Ordering::Relaxed);
+                    recording.store(false, Ordering::Relaxed);
+                    reset_hotkey_capture_state(
+                        hotkey_runtime.as_ref(),
+                        discard_short_hotkey_capture.as_ref(),
+                    );
+                    return;
+                }
+            }
+        }
+    }
+
     let wav_path = minutes_core::pid::current_wav_path();
     let recording_started_at = chrono::Local::now();
 
@@ -1331,7 +1758,7 @@ pub fn start_recording(
 
                 match minutes_core::jobs::queue_live_capture(
                     mode,
-                    None,
+                    requested_title.clone(),
                     &wav_path,
                     user_notes,
                     pre_context,
@@ -1449,9 +1876,137 @@ pub fn start_recording(
     );
 }
 
+#[allow(clippy::too_many_arguments)]
+pub fn launch_recording(
+    app: tauri::AppHandle,
+    state: &AppState,
+    mode: CaptureMode,
+    requested_intent: Option<RecordingIntent>,
+    allow_degraded: bool,
+    requested_title: Option<String>,
+    language_override: Option<String>,
+    hotkey_runtime: Option<Arc<Mutex<HotkeyRuntime>>>,
+    discard_short_hotkey_capture: Option<Arc<AtomicBool>>,
+) -> Result<(), String> {
+    if recording_active(&state.recording) || state.starting.load(Ordering::Relaxed) {
+        return Err("Already recording".into());
+    }
+    if state.live_transcript_active.load(Ordering::Relaxed) {
+        return Err("Live transcript in progress — stop it first".into());
+    }
+
+    state.starting.store(true, Ordering::Relaxed);
+    let rec = state.recording.clone();
+    let starting = state.starting.clone();
+    let stop = state.stop_flag.clone();
+    let processing = state.processing.clone();
+    let processing_stage = state.processing_stage.clone();
+    let latest_output = state.latest_output.clone();
+    let call_capture_health = state.call_capture_health.clone();
+    let completion_notifications_enabled = state.completion_notifications_enabled.clone();
+    let app_done = app.clone();
+
+    std::thread::spawn(move || {
+        start_recording(
+            app,
+            rec,
+            starting,
+            stop,
+            processing,
+            processing_stage,
+            latest_output,
+            call_capture_health,
+            completion_notifications_enabled,
+            hotkey_runtime,
+            discard_short_hotkey_capture,
+            mode,
+            requested_intent,
+            allow_degraded,
+            requested_title,
+            language_override,
+        );
+        crate::update_tray_state(&app_done, false);
+    });
+
+    Ok(())
+}
+
+pub fn handle_desktop_control_request(
+    app: tauri::AppHandle,
+    state: &AppState,
+    request: minutes_core::desktop_control::DesktopControlRequest,
+) -> minutes_core::desktop_control::DesktopControlResponse {
+    fn activation_detail(state: &AppState) -> String {
+        state
+            .latest_output
+            .lock()
+            .ok()
+            .and_then(|notice| notice.clone())
+            .map(|notice| notice.detail)
+            .filter(|detail| !detail.trim().is_empty())
+            .unwrap_or_else(|| {
+                "Minutes desktop app did not confirm that recording became active.".into()
+            })
+    }
+
+    let detail = match request.action {
+        minutes_core::desktop_control::DesktopControlAction::StartRecording(payload) => {
+            match launch_recording(
+                app,
+                state,
+                payload.mode,
+                payload.intent,
+                payload.allow_degraded,
+                payload.title,
+                payload.language,
+                None,
+                None,
+            ) {
+                Ok(()) => {
+                    let start = Instant::now();
+                    while start.elapsed() < Duration::from_secs(12) {
+                        if recording_active(&state.recording) {
+                            return minutes_core::desktop_control::DesktopControlResponse {
+                                id: request.id,
+                                handled_at: chrono::Local::now(),
+                                accepted: true,
+                                detail:
+                                    "Recording request accepted by the running Minutes desktop app."
+                                        .into(),
+                            };
+                        }
+                        if !state.starting.load(Ordering::Relaxed) {
+                            return minutes_core::desktop_control::DesktopControlResponse {
+                                id: request.id,
+                                handled_at: chrono::Local::now(),
+                                accepted: false,
+                                detail: activation_detail(state),
+                            };
+                        }
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
+                    return minutes_core::desktop_control::DesktopControlResponse {
+                        id: request.id,
+                        handled_at: chrono::Local::now(),
+                        accepted: false,
+                        detail: activation_detail(state),
+                    };
+                }
+                Err(error) => error,
+            }
+        }
+    };
+
+    minutes_core::desktop_control::DesktopControlResponse {
+        id: request.id,
+        handled_at: chrono::Local::now(),
+        accepted: false,
+        detail,
+    }
+}
+
 fn spawn_hotkey_recording(app: &tauri::AppHandle, style: HotkeyCaptureStyle) {
     let state = app.state::<AppState>();
-    state.starting.store(true, Ordering::Relaxed);
     if let Ok(mut runtime) = state.hotkey_runtime.lock() {
         runtime.active_capture = Some(style);
         runtime.recording_started_at = Some(Instant::now());
@@ -1459,33 +2014,19 @@ fn spawn_hotkey_recording(app: &tauri::AppHandle, style: HotkeyCaptureStyle) {
     state
         .discard_short_hotkey_capture
         .store(false, Ordering::Relaxed);
-    let rec = state.recording.clone();
-    let starting = state.starting.clone();
-    let stop = state.stop_flag.clone();
-    let processing = state.processing.clone();
-    let processing_stage = state.processing_stage.clone();
-    let latest_output = state.latest_output.clone();
-    let completion_notifications_enabled = state.completion_notifications_enabled.clone();
     let hotkey_runtime = state.hotkey_runtime.clone();
     let discard_short_hotkey_capture = state.discard_short_hotkey_capture.clone();
-    let app_handle = app.clone();
-    let app_done = app.clone();
-    std::thread::spawn(move || {
-        start_recording(
-            app_handle,
-            rec,
-            starting,
-            stop,
-            processing,
-            processing_stage,
-            latest_output,
-            completion_notifications_enabled,
-            Some(hotkey_runtime),
-            Some(discard_short_hotkey_capture),
-            CaptureMode::QuickThought,
-        );
-        crate::update_tray_state(&app_done, false);
-    });
+    let _ = launch_recording(
+        app.clone(),
+        &state,
+        CaptureMode::QuickThought,
+        Some(RecordingIntent::Memo),
+        false,
+        None,
+        None,
+        Some(hotkey_runtime),
+        Some(discard_short_hotkey_capture),
+    );
 }
 
 pub fn handle_global_hotkey_event(
@@ -1679,40 +2220,24 @@ pub fn cmd_start_recording(
     app: tauri::AppHandle,
     state: tauri::State<AppState>,
     mode: Option<String>,
+    intent: Option<String>,
+    allow_degraded: Option<bool>,
+    title: Option<String>,
+    language: Option<String>,
 ) -> Result<(), String> {
-    if recording_active(&state.recording) || state.starting.load(Ordering::Relaxed) {
-        return Err("Already recording".into());
-    }
-    if state.live_transcript_active.load(Ordering::Relaxed) {
-        return Err("Live transcript in progress — stop it first".into());
-    }
     let capture_mode = parse_capture_mode(mode.as_deref())?;
-    state.starting.store(true, Ordering::Relaxed);
-    let rec = state.recording.clone();
-    let starting = state.starting.clone();
-    let stop = state.stop_flag.clone();
-    let processing = state.processing.clone();
-    let processing_stage = state.processing_stage.clone();
-    let latest_output = state.latest_output.clone();
-    let completion_notifications_enabled = state.completion_notifications_enabled.clone();
-    let app_done = app.clone();
-    std::thread::spawn(move || {
-        start_recording(
-            app,
-            rec,
-            starting,
-            stop,
-            processing,
-            processing_stage,
-            latest_output,
-            completion_notifications_enabled,
-            None,
-            None,
-            capture_mode,
-        );
-        crate::update_tray_state(&app_done, false);
-    });
-    Ok(())
+    let requested_intent = parse_recording_intent(intent.as_deref())?;
+    launch_recording(
+        app,
+        &state,
+        capture_mode,
+        requested_intent,
+        allow_degraded.unwrap_or(false),
+        title,
+        language,
+        None,
+        None,
+    )
 }
 
 #[tauri::command]
@@ -1742,6 +2267,11 @@ pub fn cmd_status(state: tauri::State<AppState>) -> serde_json::Value {
         .lock()
         .ok()
         .and_then(|notice| notice.clone());
+    let call_capture_health = state
+        .call_capture_health
+        .lock()
+        .ok()
+        .and_then(|health| health.clone());
     let processing_jobs: Vec<ProcessingJobView> = minutes_core::jobs::active_jobs()
         .into_iter()
         .map(processing_job_view)
@@ -1788,6 +2318,7 @@ pub fn cmd_status(state: tauri::State<AppState>) -> serde_json::Value {
         "processingJobCount": status.processing_job_count,
         "processingJobs": processing_jobs,
         "latestOutput": latest_output,
+        "callCaptureHealth": call_capture_health,
         "pid": status.pid,
         "elapsed": elapsed,
         "audioLevel": audio_level,
@@ -2080,6 +2611,7 @@ pub fn cmd_permission_center() -> serde_json::Value {
     let items = vec![
         model_status(&config),
         microphone_status(),
+        call_capture_status(),
         calendar_status(),
         watcher_status(&config),
         output_dir_status(&config),
@@ -2834,6 +3366,23 @@ pub fn cmd_set_setting(section: String, key: String, value: String) -> Result<St
 }
 
 #[tauri::command]
+pub fn cmd_get_autostart(app: tauri::AppHandle) -> bool {
+    use tauri_plugin_autostart::ManagerExt;
+    app.autolaunch().is_enabled().unwrap_or(false)
+}
+
+#[tauri::command]
+pub fn cmd_set_autostart(app: tauri::AppHandle, enabled: bool) -> Result<(), String> {
+    use tauri_plugin_autostart::ManagerExt;
+    let manager = app.autolaunch();
+    if enabled {
+        manager.enable().map_err(|e| e.to_string())
+    } else {
+        manager.disable().map_err(|e| e.to_string())
+    }
+}
+
+#[tauri::command]
 pub fn cmd_get_storage_stats() -> serde_json::Value {
     let config = Config::load();
 
@@ -2959,6 +3508,36 @@ mod tests {
         let current = latest_output.lock().unwrap().clone().unwrap();
         assert_eq!(current.title, "Demo");
         assert_eq!(current.path, "/tmp/demo.md");
+    }
+
+    #[test]
+    fn needs_review_jobs_surface_as_preserved_capture_notices() {
+        let job = minutes_core::jobs::ProcessingJob {
+            id: "job-review".into(),
+            title: Some("Interview".into()),
+            mode: CaptureMode::Meeting,
+            content_type: ContentType::Meeting,
+            state: minutes_core::jobs::JobState::NeedsReview,
+            stage: minutes_core::jobs::JobState::NeedsReview.default_stage(),
+            output_path: Some("/tmp/interview.md".into()),
+            audio_path: "/tmp/interview.wav".into(),
+            error: Some("silence strip removed ALL audio".into()),
+            created_at: chrono::Local::now(),
+            started_at: None,
+            finished_at: Some(chrono::Local::now()),
+            recording_started_at: None,
+            recording_finished_at: None,
+            user_notes: None,
+            pre_context: None,
+            calendar_event: None,
+            word_count: Some(0),
+            owner_pid: None,
+        };
+
+        let notice = output_notice_from_job(&job).expect("needs-review notice");
+        assert_eq!(notice.kind, "preserved-capture");
+        assert_eq!(notice.path, "/tmp/interview.wav");
+        assert!(notice.detail.contains("silence strip"));
     }
 
     #[test]

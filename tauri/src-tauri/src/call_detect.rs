@@ -15,11 +15,35 @@ use std::time::{Duration, Instant};
 use minutes_core::config::CallDetectionConfig;
 use tauri::Emitter;
 
+fn log_call_detect_event(
+    level: &str,
+    action: &str,
+    app_name: Option<&str>,
+    process_name: Option<&str>,
+    extra: serde_json::Value,
+) {
+    minutes_core::logging::append_log(&serde_json::json!({
+        "ts": chrono::Local::now().to_rfc3339(),
+        "level": level,
+        "step": "call_detect",
+        "file": "",
+        "extra": {
+            "action": action,
+            "app_name": app_name,
+            "process_name": process_name,
+            "details": extra,
+        }
+    }))
+    .ok();
+}
+
 /// State for the call detection background loop.
 pub struct CallDetector {
     config: CallDetectionConfig,
-    /// Cooldown: (app_name, last_notified_time)
-    last_notified: Mutex<Vec<(String, Instant)>>,
+    /// Last observed active call session. We still re-arm on call end/start,
+    /// but we also re-notify the same active app after a short interval so
+    /// back-to-back meetings and sticky Zoom states don't go silent forever.
+    active_call: Mutex<Option<ActiveCallState>>,
 }
 
 /// Payload emitted to the frontend when a call is detected.
@@ -29,11 +53,25 @@ pub struct CallDetectedPayload {
     pub process_name: String,
 }
 
+#[derive(Clone)]
+struct ActiveCallState {
+    process_name: String,
+    last_notified_at: Instant,
+}
+
+enum DetectionTransition {
+    NewSession,
+    Reminder,
+    Noop,
+}
+
+const SAME_APP_REMINDER_SECS: u64 = 20;
+
 impl CallDetector {
     pub fn new(config: CallDetectionConfig) -> Self {
         Self {
             config,
-            last_notified: Mutex::new(Vec::new()),
+            active_call: Mutex::new(None),
         }
     }
 
@@ -46,6 +84,16 @@ impl CallDetector {
     ) {
         if !self.config.enabled {
             eprintln!("[call-detect] disabled in config");
+            log_call_detect_event(
+                "info",
+                "disabled",
+                None,
+                None,
+                serde_json::json!({
+                    "poll_interval_secs": self.config.poll_interval_secs,
+                    "apps": self.config.apps,
+                }),
+            );
             return;
         }
 
@@ -54,6 +102,16 @@ impl CallDetector {
             "[call-detect] started — polling every {}s for {:?}",
             interval.as_secs(),
             self.config.apps
+        );
+        log_call_detect_event(
+            "info",
+            "started",
+            None,
+            None,
+            serde_json::json!({
+                "poll_interval_secs": interval.as_secs(),
+                "apps": self.config.apps,
+            }),
         );
 
         std::thread::spawn(move || {
@@ -69,29 +127,56 @@ impl CallDetector {
                 }
 
                 if let Some((display_name, process_name)) = self.detect_active_call() {
-                    if !self.in_cooldown(&process_name) {
-                        eprintln!(
-                            "[call-detect] detected: {} ({})",
-                            display_name, process_name
-                        );
-                        self.set_cooldown(&process_name);
+                    match self.note_active_call(&process_name) {
+                        DetectionTransition::Noop => {}
+                        transition => {
+                            let action = match transition {
+                                DetectionTransition::NewSession => "detected",
+                                DetectionTransition::Reminder => "reminder",
+                                DetectionTransition::Noop => unreachable!(),
+                            };
+                            eprintln!(
+                                "[call-detect] {}: {} ({})",
+                                action, display_name, process_name
+                            );
+                            log_call_detect_event(
+                                "info",
+                                action,
+                                Some(&display_name),
+                                Some(&process_name),
+                                serde_json::json!({
+                                    "recording_active": recording.load(Ordering::Relaxed),
+                                    "reminder_interval_secs": SAME_APP_REMINDER_SECS,
+                                }),
+                            );
 
-                        // Notify via macOS notification
-                        crate::commands::show_user_notification(
-                            &app,
-                            &format!("{} call detected", display_name),
-                            "Open Minutes to start recording",
-                        );
+                            crate::commands::show_user_notification(
+                                &app,
+                                &format!("{} call detected", display_name),
+                                "Open Minutes to start recording",
+                            );
 
-                        // Emit event to frontend for in-app banner
-                        app.emit(
-                            "call:detected",
-                            CallDetectedPayload {
-                                app_name: display_name,
-                                process_name,
-                            },
-                        )
-                        .ok();
+                            app.emit(
+                                "call:detected",
+                                CallDetectedPayload {
+                                    app_name: display_name,
+                                    process_name,
+                                },
+                            )
+                            .ok();
+                        }
+                    }
+                } else {
+                    if let Some(previous) = self.clear_active_call() {
+                        log_call_detect_event(
+                            "info",
+                            "cleared",
+                            None,
+                            Some(&previous),
+                            serde_json::json!({
+                                "reason": "no active call detected on current poll"
+                            }),
+                        );
                     }
                 }
             }
@@ -121,22 +206,40 @@ impl CallDetector {
         None
     }
 
-    fn in_cooldown(&self, process_name: &str) -> bool {
-        let cooldown = Duration::from_secs(self.config.cooldown_minutes * 60);
-        let entries = self.last_notified.lock().unwrap();
-        entries
-            .iter()
-            .any(|(name, time)| name == process_name && time.elapsed() < cooldown)
+    fn note_active_call(&self, process_name: &str) -> DetectionTransition {
+        let mut active = self.active_call.lock().unwrap();
+        let now = Instant::now();
+        match active.as_mut() {
+            None => {
+                *active = Some(ActiveCallState {
+                    process_name: process_name.to_string(),
+                    last_notified_at: now,
+                });
+                DetectionTransition::NewSession
+            }
+            Some(state) if state.process_name != process_name => {
+                *state = ActiveCallState {
+                    process_name: process_name.to_string(),
+                    last_notified_at: now,
+                };
+                DetectionTransition::NewSession
+            }
+            Some(state) => {
+                if now.duration_since(state.last_notified_at)
+                    >= Duration::from_secs(SAME_APP_REMINDER_SECS)
+                {
+                    state.last_notified_at = now;
+                    DetectionTransition::Reminder
+                } else {
+                    DetectionTransition::Noop
+                }
+            }
+        }
     }
 
-    fn set_cooldown(&self, process_name: &str) {
-        let mut entries = self.last_notified.lock().unwrap();
-        // Remove old entry for this app if exists
-        entries.retain(|(name, _)| name != process_name);
-        entries.push((process_name.to_string(), Instant::now()));
-        // Prune stale entries
-        let cutoff = Duration::from_secs(self.config.cooldown_minutes * 60 * 2);
-        entries.retain(|(_, time)| time.elapsed() < cutoff);
+    fn clear_active_call(&self) -> Option<String> {
+        let mut active = self.active_call.lock().unwrap();
+        active.take().map(|state| state.process_name)
     }
 }
 
@@ -249,7 +352,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cooldown_tracking() {
+    fn call_session_rearms_when_process_changes_or_ends() {
         let detector = CallDetector::new(CallDetectionConfig {
             enabled: true,
             poll_interval_secs: 1,
@@ -257,10 +360,11 @@ mod tests {
             apps: vec!["zoom.us".into()],
         });
 
-        assert!(!detector.in_cooldown("zoom.us"));
-        detector.set_cooldown("zoom.us");
-        assert!(detector.in_cooldown("zoom.us"));
-        assert!(!detector.in_cooldown("FaceTime"));
+        assert!(detector.note_active_call("zoom.us"));
+        assert!(!detector.note_active_call("zoom.us"));
+        detector.clear_active_call();
+        assert!(detector.note_active_call("zoom.us"));
+        assert!(detector.note_active_call("face.time"));
     }
 
     #[test]

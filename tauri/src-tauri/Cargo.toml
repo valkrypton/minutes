@@ -14,6 +14,8 @@ tauri = { version = "2", features = ["tray-icon", "image-png", "devtools", "maco
 tauri-plugin-shell = "2"
 tauri-plugin-global-shortcut = "2"
 tauri-plugin-dialog = "2"
+tauri-plugin-notification = "2"
+notify-rust = "4.12.0"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = { workspace = true }
@@ -24,6 +26,7 @@ libc = "0.2"
 portable-pty = "0.9"
 base64 = "0.22"
 tauri-plugin-pty = "0.1"
+tauri-plugin-autostart = "2"
 walkdir = { workspace = true }
 ureq = { workspace = true }
 

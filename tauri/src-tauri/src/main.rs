@@ -8,6 +8,7 @@ use tauri::{
     Emitter, Manager, WebviewUrl, WebviewWindowBuilder,
 };
 
+mod call_capture;
 mod call_detect;
 mod commands;
 mod context;
@@ -439,6 +440,11 @@ fn main() {
         )
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            None,
+        ))
         .manage(commands::AppState {
             recording: recording.clone(),
             starting: starting.clone(),
@@ -446,6 +452,7 @@ fn main() {
             processing: processing.clone(),
             processing_stage: processing_stage.clone(),
             latest_output: latest_output.clone(),
+            call_capture_health: Arc::new(Mutex::new(None)),
             completion_notifications_enabled: completion_notifications_enabled.clone(),
             global_hotkey_enabled: global_hotkey_enabled.clone(),
             global_hotkey_shortcut: global_hotkey_shortcut.clone(),
@@ -704,29 +711,21 @@ fn main() {
                             stp_item.set_enabled(true).ok();
                             let app_handle = app.clone();
                             let app_done = app.clone();
-                            let rec = recording.clone();
-                            let starting = starting.clone();
-                            let sf = stop.clone();
-                            let processing = processing.clone();
-                            let processing_stage = processing_stage.clone();
-                            let latest_output = latest_output.clone();
-                            let completion_notifications_enabled =
-                                completion_notifications_enabled.clone();
                             let ri = rec_item.clone();
                             let si = stp_item.clone();
                             std::thread::spawn(move || {
-                                commands::start_recording(
-                                    app_handle,
-                                    rec,
-                                    starting,
-                                    sf,
-                                    processing,
-                                    processing_stage,
-                                    latest_output,
-                                    completion_notifications_enabled,
-                                    None,
-                                    None,
+                                let app_for_launch = app_handle.clone();
+                                let state = app_handle.state::<commands::AppState>();
+                                let _ = commands::launch_recording(
+                                    app_for_launch,
+                                    &state,
                                     minutes_core::CaptureMode::Meeting,
+                                    None,
+                                    false,
+                                    None,
+                                    None,
+                                    None,
+                                    None,
                                 );
                                 ri.set_text("Start Recording").ok();
                                 ri.set_enabled(true).ok();
@@ -745,30 +744,22 @@ fn main() {
                             stp_item.set_enabled(true).ok();
                             let app_handle = app.clone();
                             let app_done = app.clone();
-                            let rec = recording.clone();
-                            let starting = starting.clone();
-                            let sf = stop.clone();
-                            let processing = processing.clone();
-                            let processing_stage = processing_stage.clone();
-                            let latest_output = latest_output.clone();
-                            let completion_notifications_enabled =
-                                completion_notifications_enabled.clone();
                             let ri = rec_item.clone();
                             let qi = quick_item.clone();
                             let si = stp_item.clone();
                             std::thread::spawn(move || {
-                                commands::start_recording(
-                                    app_handle,
-                                    rec,
-                                    starting,
-                                    sf,
-                                    processing,
-                                    processing_stage,
-                                    latest_output,
-                                    completion_notifications_enabled,
-                                    None,
-                                    None,
+                                let app_for_launch = app_handle.clone();
+                                let state = app_handle.state::<commands::AppState>();
+                                let _ = commands::launch_recording(
+                                    app_for_launch,
+                                    &state,
                                     minutes_core::CaptureMode::QuickThought,
+                                    Some(minutes_core::capture::RecordingIntent::Memo),
+                                    false,
+                                    None,
+                                    None,
+                                    None,
+                                    None,
                                 );
                                 ri.set_text("Start Recording").ok();
                                 ri.set_enabled(true).ok();
@@ -912,29 +903,21 @@ fn main() {
                             stp_item.set_enabled(true).ok();
                             let app_handle = app.clone();
                             let app_done = app.clone();
-                            let rec = recording.clone();
-                            let starting = starting.clone();
-                            let sf = stop.clone();
-                            let processing = processing.clone();
-                            let processing_stage = processing_stage.clone();
-                            let latest_output = latest_output.clone();
-                            let completion_notifications_enabled =
-                                completion_notifications_enabled.clone();
                             let ri = rec_item.clone();
                             let si = stp_item.clone();
                             std::thread::spawn(move || {
-                                commands::start_recording(
-                                    app_handle,
-                                    rec,
-                                    starting,
-                                    sf,
-                                    processing,
-                                    processing_stage,
-                                    latest_output,
-                                    completion_notifications_enabled,
-                                    None,
-                                    None,
+                                let app_for_launch = app_handle.clone();
+                                let state = app_handle.state::<commands::AppState>();
+                                let _ = commands::launch_recording(
+                                    app_for_launch,
+                                    &state,
                                     minutes_core::CaptureMode::Meeting,
+                                    None,
+                                    false,
+                                    None,
+                                    None,
+                                    None,
+                                    None,
                                 );
                                 ri.set_text("Start Recording").ok();
                                 ri.set_enabled(true).ok();
@@ -961,10 +944,36 @@ fn main() {
                 );
             }
 
+            let app_control = app.handle().clone();
+            std::thread::spawn(move || loop {
+                let status = minutes_core::desktop_control::DesktopAppStatus {
+                    pid: std::process::id(),
+                    updated_at: chrono::Local::now(),
+                    platform: std::env::consts::OS.into(),
+                };
+                minutes_core::desktop_control::write_desktop_app_status(&status).ok();
+
+                let pending = minutes_core::desktop_control::pending_requests();
+                if !pending.is_empty() {
+                    let state = app_control.state::<commands::AppState>();
+                    for request in pending {
+                        let response = commands::handle_desktop_control_request(
+                            app_control.clone(),
+                            &state,
+                            request.clone(),
+                        );
+                        minutes_core::desktop_control::write_response(&response).ok();
+                        minutes_core::desktop_control::remove_request(&request.id).ok();
+                    }
+                }
+
+                std::thread::sleep(std::time::Duration::from_secs(2));
+            });
+
             // Calendar items in tray menu — refresh every minute
             // Delay first refresh so the app window is interactive before
             // osascript Calendar queries block the main-thread menu updates.
-            if commands::supports_calendar_integration() {
+            if commands::supports_calendar_integration() && startup_config.calendar.enabled {
                 let app_cal = app.handle().clone();
                 let menu_cal = menu.clone();
                 let cal_timer = cal_state.clone();
@@ -1023,6 +1032,8 @@ fn main() {
             commands::cmd_terminal_info,
             commands::cmd_get_settings,
             commands::cmd_set_setting,
+            commands::cmd_get_autostart,
+            commands::cmd_set_autostart,
             commands::cmd_get_storage_stats,
             commands::cmd_vault_status,
             commands::cmd_vault_setup,
