@@ -21,6 +21,7 @@
  *   - register_qmd_collection: Register Minutes output as QMD collection
  *   - list_voices: List enrolled voice profiles for speaker identification
  *   - confirm_speaker: Confirm/correct speaker attribution in a meeting
+ *   - get_meeting_insights: Query structured insights (decisions, commitments, etc.) with confidence filtering
  *
  * All tools use execFile (not exec) to shell out to the `minutes` CLI binary.
  * No shell interpolation — safe from injection.
@@ -1861,6 +1862,60 @@ server.tool(
       const msg = error?.stderr || error?.message || String(error);
       return {
         content: [{ type: "text" as const, text: `Failed to confirm speaker: ${msg}` }],
+        isError: true,
+      };
+    }
+  }
+);
+
+// ── Tool: get_meeting_insights ─────────────────────────────
+
+server.tool(
+  "get_meeting_insights",
+  "Query structured insights extracted from meetings — decisions, commitments, approvals, questions, blockers, follow-ups, and risks. Each insight has a confidence level (tentative/inferred/strong/explicit). Use this to find what was decided, who committed to what, and what's still open across all meetings. External systems can subscribe to these events for workflow automation.",
+  {
+    kind: z.enum(["decision", "commitment", "approval", "question", "blocker", "follow_up", "risk"]).optional().describe("Filter by insight type"),
+    confidence: z.enum(["tentative", "inferred", "strong", "explicit"]).optional().describe("Minimum confidence level"),
+    participant: z.string().optional().describe("Filter by participant name (partial match)"),
+    since: z.string().optional().describe("Only insights since this date (YYYY-MM-DD)"),
+    limit: z.number().optional().default(50).describe("Maximum number of results"),
+    actionable_only: z.boolean().optional().default(false).describe("Only return actionable insights (Strong or Explicit confidence)"),
+  },
+  { title: "Get Meeting Insights", readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  async ({ kind, confidence, participant, since, limit, actionable_only }) => {
+    if (!(await isCliAvailable())) {
+      return { content: [{ type: "text" as const, text: CLI_INSTALL_MSG }] };
+    }
+
+    const args = ["insights", "--limit", String(limit ?? 50)];
+    if (kind) { args.push("--kind", kind); }
+    if (actionable_only) {
+      args.push("--actionable");
+    } else if (confidence) {
+      args.push("--confidence", confidence);
+    }
+    if (participant) { args.push("--participant", participant); }
+    if (since) { args.push("--since", since); }
+
+    try {
+      const { stdout } = await runMinutes(args);
+      const insights = parseJsonOutput(stdout);
+      const count = Array.isArray(insights) ? insights.length : 0;
+
+      if (count === 0) {
+        return {
+          content: [{ type: "text" as const, text: "No meeting insights found matching the filter criteria. Insights are extracted when meetings are processed with summarization enabled." }],
+        };
+      }
+
+      return {
+        content: [{ type: "text" as const, text: `Found ${count} insight(s):\n\n${JSON.stringify(insights, null, 2)}` }],
+        structuredContent: { count, insights },
+      };
+    } catch (error: any) {
+      const msg = error?.stderr || error?.message || String(error);
+      return {
+        content: [{ type: "text" as const, text: `Failed to query insights: ${msg}` }],
         isError: true,
       };
     }

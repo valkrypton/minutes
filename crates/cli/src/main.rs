@@ -333,6 +333,33 @@ enum Commands {
         since: Option<String>,
     },
 
+    /// Query structured meeting insights (decisions, commitments, approvals, etc.)
+    Insights {
+        /// Filter by insight type: decision, commitment, approval, question, blocker, follow_up, risk
+        #[arg(short, long)]
+        kind: Option<String>,
+
+        /// Minimum confidence: tentative, inferred, strong, explicit
+        #[arg(short, long)]
+        confidence: Option<String>,
+
+        /// Filter by participant name (partial match)
+        #[arg(short, long)]
+        participant: Option<String>,
+
+        /// Only insights since this date (YYYY-MM-DD)
+        #[arg(long)]
+        since: Option<String>,
+
+        /// Maximum number of results
+        #[arg(short, long, default_value = "50")]
+        limit: usize,
+
+        /// Only show actionable insights (Strong or Explicit confidence)
+        #[arg(short, long)]
+        actionable: bool,
+    },
+
     /// Import meetings from another app (e.g., Granola)
     Import {
         /// Source app: granola
@@ -574,6 +601,9 @@ fn main() -> Result<()> {
         Commands::Schema => cmd_schema(),
         Commands::Get { slug } => cmd_get(&slug, &config),
         Commands::Events { limit, since } => cmd_events(limit, since, &config),
+        Commands::Insights { kind, confidence, participant, since, limit, actionable } => {
+            cmd_insights(kind, confidence, participant, since, limit, actionable)
+        }
         Commands::Import { from, dir, dry_run } => {
             cmd_import(&from, dir.as_deref(), dry_run, &config)
         }
@@ -775,7 +805,10 @@ fn spawn_queue_worker() -> Result<()> {
     let exe = std::env::current_exe()?;
     let child = std::process::Command::new(exe)
         .arg("process-queue")
-        .env("RUST_LOG", std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into()))
+        .env(
+            "RUST_LOG",
+            std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into()),
+        )
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -2518,6 +2551,92 @@ fn cmd_events(limit: usize, since: Option<String>, _config: &Config) -> Result<(
 
     let events = minutes_core::events::read_events(since_dt, Some(limit));
     let json = serde_json::to_string_pretty(&events)?;
+    println!("{}", json);
+    Ok(())
+}
+
+fn cmd_insights(
+    kind: Option<String>,
+    confidence: Option<String>,
+    participant: Option<String>,
+    since: Option<String>,
+    limit: usize,
+    actionable: bool,
+) -> Result<()> {
+    use minutes_core::events::{InsightConfidence, InsightFilter, InsightKind};
+
+    let since_dt = if let Some(s) = since.as_deref() {
+        match chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+            Ok(d) => d
+                .and_hms_opt(0, 0, 0)
+                .and_then(|ndt| chrono::Local.from_local_datetime(&ndt).single()),
+            Err(e) => {
+                eprintln!("warning: invalid date '{}' (expected YYYY-MM-DD): {}", s, e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let kind_filter = match kind.as_deref() {
+        Some("decision") => Some(InsightKind::Decision),
+        Some("commitment") => Some(InsightKind::Commitment),
+        Some("approval") => Some(InsightKind::Approval),
+        Some("question") => Some(InsightKind::Question),
+        Some("blocker") => Some(InsightKind::Blocker),
+        Some("follow_up") | Some("followup") => Some(InsightKind::FollowUp),
+        Some("risk") => Some(InsightKind::Risk),
+        Some(other) => {
+            eprintln!("warning: unknown insight kind '{}', showing all", other);
+            None
+        }
+        None => None,
+    };
+
+    let min_confidence = if actionable {
+        Some(InsightConfidence::Strong)
+    } else {
+        confidence.as_deref().map(|c| match c {
+            "tentative" => InsightConfidence::Tentative,
+            "inferred" => InsightConfidence::Inferred,
+            "strong" => InsightConfidence::Strong,
+            "explicit" => InsightConfidence::Explicit,
+            other => {
+                eprintln!("warning: unknown confidence '{}', showing all", other);
+                InsightConfidence::Tentative
+            }
+        })
+    };
+
+    let filter = InsightFilter {
+        kind: kind_filter,
+        min_confidence,
+        participant,
+        since: since_dt,
+        limit: Some(limit),
+    };
+
+    let insights = minutes_core::events::read_insights(&filter);
+    let output: Vec<serde_json::Value> = insights
+        .into_iter()
+        .map(|(ts, insight, meeting_title)| {
+            serde_json::json!({
+                "timestamp": ts.to_rfc3339(),
+                "meeting_title": meeting_title,
+                "kind": insight.kind,
+                "content": insight.content,
+                "confidence": insight.confidence,
+                "participants": insight.participants,
+                "owner": insight.owner,
+                "deadline": insight.deadline,
+                "topic": insight.topic,
+                "source_meeting": insight.source_meeting,
+            })
+        })
+        .collect();
+
+    let json = serde_json::to_string_pretty(&output)?;
     println!("{}", json);
     Ok(())
 }
