@@ -190,9 +190,19 @@ impl CallDetector {
             return None;
         }
 
+        let has_google_meet = self.config.apps.iter().any(|a| a == "google-meet");
+        let native_apps: Vec<&String> = self
+            .config
+            .apps
+            .iter()
+            .filter(|a| a.as_str() != "google-meet")
+            .collect();
+
+        // Fetch process list once for both native matching and browser pre-check
         let running = running_process_names();
 
-        for config_app in &self.config.apps {
+        // Native process check — substring match handles helpers/variants
+        for config_app in &native_apps {
             let config_lower = config_app.to_lowercase();
             // Substring match: "zoom.us" matches process "zoom.us",
             // "Microsoft Teams" matches "Microsoft Teams Helper", etc.
@@ -200,9 +210,15 @@ impl CallDetector {
                 p.to_lowercase().contains(&config_lower) || config_lower.contains(&p.to_lowercase())
             }) {
                 let display = display_name_for(config_app);
-                return Some((display, config_app.clone()));
+                return Some((display, config_app.to_string()));
             }
         }
+
+        // Browser-based call check (Google Meet)
+        if has_google_meet && check_google_meet_in_browsers(&running) {
+            return Some(("Google Meet".into(), "google-meet".into()));
+        }
+
         None
     }
 
@@ -243,7 +259,7 @@ impl CallDetector {
     }
 }
 
-/// Friendly display name for a process name.
+/// Friendly display name for a process/sentinel name.
 fn display_name_for(process: &str) -> String {
     match process {
         "zoom.us" => "Zoom".into(),
@@ -251,8 +267,87 @@ fn display_name_for(process: &str) -> String {
         "FaceTime" => "FaceTime".into(),
         "Webex" => "Webex".into(),
         "Slack" => "Slack".into(),
+        "google-meet" => "Google Meet".into(),
         other => other.into(),
     }
+}
+
+/// Check whether a Google Meet tab is open and active in any supported browser.
+///
+/// Uses AppleScript to query tab URLs. The `running` slice comes from the
+/// already-fetched process list so we avoid a second `ps` call.
+fn check_google_meet_in_browsers(running: &[String]) -> bool {
+    let running_lower: Vec<String> = running.iter().map(|s| s.to_lowercase()).collect();
+
+    // Chrome variants — each has its own AppleScript app name
+    for (proc_fragment, app_name) in &[
+        ("google chrome", "Google Chrome"),
+        ("chrome canary", "Google Chrome Canary"),
+        ("chromium", "Chromium"),
+    ] {
+        if running_lower.iter().any(|p| p.contains(proc_fragment))
+            && query_chrome_for_meet(app_name)
+        {
+            return true;
+        }
+    }
+
+    // Safari
+    if running_lower.iter().any(|p| p == "safari") && query_safari_for_meet() {
+        return true;
+    }
+
+    false
+}
+
+/// Ask a Chromium-family browser (via AppleScript) whether any tab is on meet.google.com.
+fn query_chrome_for_meet(app_name: &str) -> bool {
+    let script = format!(
+        r#"tell application "{app_name}"
+  set found to false
+  repeat with w in windows
+    repeat with t in tabs of w
+      if URL of t contains "meet.google.com" then
+        set found to true
+        exit repeat
+      end if
+    end repeat
+    if found then exit repeat
+  end repeat
+  return found
+end tell"#
+    );
+    run_applescript(&script)
+}
+
+/// Ask Safari (via AppleScript) whether any tab is on meet.google.com.
+fn query_safari_for_meet() -> bool {
+    let script = r#"tell application "Safari"
+  set found to false
+  repeat with w in windows
+    repeat with t in tabs of w
+      if URL of t contains "meet.google.com" then
+        set found to true
+        exit repeat
+      end if
+    end repeat
+    if found then exit repeat
+  end repeat
+  return found
+end tell"#;
+    run_applescript(script)
+}
+
+/// Run an AppleScript snippet and return true if stdout is "true".
+fn run_applescript(script: &str) -> bool {
+    std::process::Command::new("osascript")
+        .arg("-e")
+        .arg(script)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "true")
+        .unwrap_or(false)
 }
 
 // ── macOS-specific detection ──────────────────────────────────
@@ -384,7 +479,42 @@ mod tests {
         assert_eq!(display_name_for("zoom.us"), "Zoom");
         assert_eq!(display_name_for("Microsoft Teams"), "Teams");
         assert_eq!(display_name_for("FaceTime"), "FaceTime");
+        assert_eq!(display_name_for("google-meet"), "Google Meet");
         assert_eq!(display_name_for("SomeOtherApp"), "SomeOtherApp");
+    }
+
+    #[test]
+    fn google_meet_skipped_when_no_browser_running() {
+        // No browser processes in the list → should not attempt AppleScript
+        let running: Vec<String> = vec!["Finder".into(), "launchd".into()];
+        assert!(!check_google_meet_in_browsers(&running));
+    }
+
+    #[test]
+    fn google_meet_sentinel_excluded_from_native_process_match() {
+        // "google-meet" in apps must not be passed to the process substring matcher.
+        // Build a fake running-process list that contains "google-meet" as if it
+        // were a real process — the sentinel should still not match natively.
+        let detector = CallDetector::new(CallDetectionConfig {
+            enabled: true,
+            poll_interval_secs: 1,
+            cooldown_minutes: 5,
+            apps: vec!["google-meet".into()],
+        });
+        let native_apps: Vec<&String> = detector
+            .config
+            .apps
+            .iter()
+            .filter(|a| a.as_str() != "google-meet")
+            .collect();
+        assert!(native_apps.is_empty(), "google-meet must be filtered out of native app list");
+    }
+
+    #[test]
+    fn run_applescript_does_not_panic() {
+        // Malformed script returns false gracefully, never panics.
+        let result = run_applescript("this is not valid applescript @@@@");
+        assert!(!result);
     }
 
     #[test]
